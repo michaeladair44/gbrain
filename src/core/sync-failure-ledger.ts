@@ -218,6 +218,7 @@ export function classifyErrorCode(errorMsg: string): string {
   // SHRINK_GUARD: importFromContent refused a >50% non-fence shrink
   // (page-wipe incident 2026-09-24). Operator bypass: sync --allow-shrink.
   if (/SHRINK_GUARD/.test(errorMsg)) return 'SHRINK_GUARD';
+  if (/DOUBLE_FACTS_FENCE/.test(errorMsg)) return 'DOUBLE_FACTS_FENCE';
 
   // SLUG_MISMATCH: thrown by importFromFile() at src/core/import-file.ts.
   if (/slug.*does not match|SLUG_MISMATCH/i.test(errorMsg)) return 'SLUG_MISMATCH';

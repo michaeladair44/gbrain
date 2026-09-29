@@ -84,9 +84,9 @@ async function runStubGuard(ctx: DoctorContext): Promise<Check[]> {
     const events = readRecentContentGuardEvents({ sinceMs: 24 * 60 * 60 * 1000 });
     if (events.length > 0) {
       const count = (k: string) => events.filter((e) => e.kind === k).length;
-      const blocked = events.filter((e) => e.kind === 'preservation_blocked' || e.kind === 'shrink_blocked');
+      const blocked = events.filter((e) => e.kind === 'preservation_blocked' || e.kind === 'shrink_blocked' || e.kind === 'double_fence_blocked');
       const split =
-        `preservation_blocked=${count('preservation_blocked')}, shrink_blocked=${count('shrink_blocked')}, ` +
+        `preservation_blocked=${count('preservation_blocked')}, shrink_blocked=${count('shrink_blocked')}, double_fence_blocked=${count('double_fence_blocked')}, ` +
         `materialized_from_db=${count('materialized_from_db')}, stub_created=${count('stub_created')}`;
       if (blocked.length > 0) {
         const slugs = [...new Set(blocked.map((e) => e.slug))].slice(0, 5).join(', ');

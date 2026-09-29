@@ -67,3 +67,60 @@ export function assertSingleFactsFence(text: string, label = 'page'): void {
     throw new Error(`DOUBLE_FACTS_FENCE: ${label} has ${n} facts fences; exactly one is allowed`);
   }
 }
+
+/**
+ * Count GENUINE facts fences: begin markers on their own line and outside
+ * fenced code blocks (same scan as extract-facts.ts
+ * timelineHasGenuineFactsFenceMarker), so a page that merely documents the
+ * marker syntax in a code example is not treated as double-fenced.
+ */
+export function countGenuineFactsFences(text: string): number {
+  if (!text.includes(FACTS_FENCE_BEGIN)) return 0;
+  const lines = text.split(/\r\n|\r|\n/);
+  const OPEN_RE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
+  const CLOSE_RE = /^ {0,3}(`{3,}|~{3,})[ \t]*$/;
+  let n = 0;
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i]!;
+    const open = OPEN_RE.exec(line);
+    if (open) {
+      const marker = open[1]!;
+      const fenceChar = marker[0]!;
+      if (!(fenceChar === '`' && open[2]!.trim().includes('`'))) {
+        let j = i + 1;
+        for (; j < lines.length; j++) {
+          const close = CLOSE_RE.exec(lines[j]!);
+          if (close && close[1]![0] === fenceChar && close[1]!.length >= marker.length) {
+            j++;
+            break;
+          }
+        }
+        i = j;
+        continue;
+      }
+    }
+    if (line.trim() === FACTS_FENCE_BEGIN) n++;
+    i++;
+  }
+  return n;
+}
+
+/**
+ * Order-insensitive preservation check for materializing a DB row to disk:
+ * the parser may legitimately move a bare `## Timeline` section from the
+ * body into the timeline column, which reorders content without losing any.
+ * Compares the whitespace-token multisets of two non-fence strings, ignoring
+ * timeline separator lines the parser consumes.
+ */
+export function sameContentTokens(a: string, b: string): boolean {
+  const tokens = (s: string) =>
+    s
+      .replace(/<!--\s*timeline\s*-->/gi, ' ')
+      .replace(/(^|\s)---\s+timeline\s+---(?=\s|$)/gi, ' ')
+      .split(/\s+/)
+      .filter((t) => t.length > 0 && !/^-{3,}$/.test(t))
+      .sort()
+      .join(' ');
+  return tokens(a) === tokens(b);
+}

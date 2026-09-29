@@ -65,6 +65,7 @@ import {
 import { writeReceipt } from '../extract/receipt-writer.ts';
 import { classifyRunStop, upsertExtractRollup } from '../extract/rollup-writer.ts';
 import { parseFactsFence, FACTS_FENCE_BEGIN } from '../facts-fence.ts';
+import { countGenuineFactsFences } from '../facts/content-preservation.ts';
 import {
   extractFactsFromFenceText,
   type FenceExtractedFact,
@@ -693,6 +694,18 @@ export async function runExtractFacts(
     // substring check false-positives on the marker text merely being
     // mentioned in a doc code-block or quoted prose, wrongly blocking a
     // genuine deletion and leaving stale facts indexed indefinitely).
+    // Double-fence trap (page-wipe incident 2026-09-24): parseFactsFence
+    // reads only the FIRST fence, so rows living in a second fence would be
+    // read as deleted and the whole page wiped + reinserted (new ids, lost
+    // source_session, broken supersession). Non-authoritative → preserve.
+    if (countGenuineFactsFences(body) > 1) {
+      result.warnings.push(
+        `${slug}: DOUBLE_FACTS_FENCE: the page body has more than one ## Facts fence. ` +
+        `Merge them into one fence and re-save — the existing indexed facts are preserved until then.`,
+      );
+      return 'next';
+    }
+
     if (timelineHasGenuineFactsFenceMarker(page.timeline ?? '')) {
       result.warnings.push(
         `${slug}: FACTS_FENCE_BELOW_SENTINEL: a ## Facts fence was found below ` +

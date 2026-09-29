@@ -55,7 +55,7 @@ import { logStubGuardEvent } from './stub-guard-audit.ts';
 import { isFactWithdrawn } from './withdrawal.ts';
 import { managedPersistenceEnabled } from '../persistence/ownership.ts';
 import { logContentGuardEvent } from './content-guard-audit.ts';
-import { nonFenceContent, isDestructiveShrink, countFactsFences } from './content-preservation.ts';
+import { nonFenceContent, isDestructiveShrink, countGenuineFactsFences, sameContentTokens } from './content-preservation.ts';
 
 /** Resolved source binding for the entity page. */
 export interface FenceTarget {
@@ -390,10 +390,22 @@ export async function writeFactsToFence(
         // Tags are source-scoped and not on the Page row (C7).
         const tags = await engine.getTags(target.slug, { sourceId: target.sourceId });
         body = serializePageToMarkdown(existingRow, tags);
-        baseline = {
-          text: nonFenceContent(existingRow.compiled_truth, existingRow.timeline),
-          source: 'db',
-        };
+        // Baseline = the materialized file as the parser reads it, so the
+        // step-4b check compares like with like (the parser may move a bare
+        // `## Timeline` section from the body into the timeline column).
+        // Separately prove the serialization itself kept every DB token.
+        const mat = parseMarkdown(body, `${target.slug}.md`);
+        baseline = { text: nonFenceContent(mat.compiled_truth, mat.timeline), source: 'db' };
+        const dbRaw = nonFenceContent(existingRow.compiled_truth, existingRow.timeline);
+        if (!sameContentTokens(dbRaw, baseline.text)) {
+          const reason = 'materializing the DB row to markdown would not preserve its content';
+          recordWriteFailure(target.slug, target.sourceId, [`preservation_guard: ${reason}`], filePath);
+          logContentGuardEvent({
+            kind: 'preservation_blocked', slug: target.slug, source_id: target.sourceId,
+            baseline: 'db', before_chars: dbRaw.length, after_chars: baseline.text.length, detail: reason,
+          });
+          return { inserted: 0, ids: [], fenceWriteFailed: true, preservationGuardBlocked: true };
+        }
         mkdirSync(dirname(filePath), { recursive: true });
       } else {
         // Stub-creation guard, two arms:
@@ -480,6 +492,25 @@ export async function writeFactsToFence(
       //    a fence write must not become impossible just because the counter
       //    hint is unavailable. The degradation is reported, never silent,
       //    because file-only numbering is the duplicate-key class above.
+      // Validate the ORIGINAL fence before touching it (Codex wipe-patch r1
+      // P1-3). upsertFactRow re-renders the fence from parseFactsFence's
+      // recovered rows, silently dropping any row the parser skipped; the
+      // mirror + next reconcile would then delete that fact. A page whose
+      // existing fence doesn't parse cleanly is not safe to append to.
+      const originalFenceWarnings = parseFactsFence(body).warnings;
+      if (originalFenceWarnings.length > 0) {
+        recordWriteFailure(
+          target.slug, target.sourceId,
+          ['preservation_guard: existing facts fence has parse warnings', ...originalFenceWarnings],
+          filePath,
+        );
+        logContentGuardEvent({
+          kind: 'preservation_blocked', slug: target.slug, source_id: target.sourceId,
+          baseline: baseline?.source ?? 'file', detail: `existing fence malformed: ${originalFenceWarnings[0]}`,
+        });
+        return { inserted: 0, ids: [], fenceWriteFailed: true, preservationGuardBlocked: true };
+      }
+
       let dbMaxRowNum = 0;
       try {
         const rows = await engine.executeRaw<{ max_row_num: number | null }>(
@@ -559,7 +590,7 @@ export async function writeFactsToFence(
       const dbText = existingRow ? nonFenceContent(existingRow.compiled_truth, existingRow.timeline) : '';
       let blockReason: string | null = null;
       let blockBaseline: { text: string; source: 'file' | 'db' } | null = null;
-      const baselineFences = countFactsFences(tmpBody);
+      const baselineFences = countGenuineFactsFences(tmpBody);
       if (baselineFences > 1) {
         // Double-fence trap: upsertFactRow only touched the first fence; the
         // reconcile would treat the other fence's rows as stale.

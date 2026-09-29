@@ -18,6 +18,8 @@
  *                             drop existing non-fence body/timeline content.
  *   - `shrink_blocked`        sync/import refused to shrink a page's
  *                             non-fence content by more than half.
+ *   - `double_fence_blocked`  sync/import refused a file with two facts
+ *                             fences (the reconcile would churn fact ids).
  *
  * `gbrain doctor` reads the last 24h (`content_guard_24h`). Same 2-file
  * (current + previous ISO week) read as stub-guard-audit.ts.
@@ -32,7 +34,8 @@ export type ContentGuardKind =
   | 'stub_created'
   | 'materialized_from_db'
   | 'preservation_blocked'
-  | 'shrink_blocked';
+  | 'shrink_blocked'
+  | 'double_fence_blocked';
 
 export interface ContentGuardEvent {
   ts: string;
