@@ -57,7 +57,7 @@ import { DEFAULT_SYNOPSIS_MODEL } from './page-summary.ts';
 import { runGuardrails } from './guardrails.ts';
 import { parseFactsFence, renderFactsTable, restoreHiddenFactRows, factsGapWarning, replaceOrInsertFactsFence } from './facts-fence.ts';
 import { scanFencedBlocks, MAX_FENCES_PER_PAGE } from './fence-scan.ts';
-import { nonFenceContent, isDestructiveShrink } from './facts/content-preservation.ts';
+import { nonFenceContent, isDestructiveShrink, countGenuineFactsFences } from './facts/content-preservation.ts';
 
 /**
  * v0.20.0 Cathedral II Layer 8 D2 — markdown fence extraction helper.
@@ -824,13 +824,37 @@ export async function importFromContent(
     }
   }
 
+  if (opts.refuseDestructiveShrink) {
+    // Double-fence trap (Codex wipe-patch r1 P1-2): parseFactsFence reads
+    // only the FIRST fence, so the extract_facts reconcile would treat the
+    // second fence's rows as stale and delete + reinsert them (new ids, lost
+    // source_session). Refuse the file instead of importing it.
+    const fenceCount = countGenuineFactsFences(parsed.compiled_truth) + countGenuineFactsFences(parsed.timeline || '');
+    if (fenceCount > 1) {
+      const { logContentGuardEvent } = await import('./facts/content-guard-audit.ts');
+      logContentGuardEvent({
+        kind: 'double_fence_blocked',
+        slug,
+        source_id: sourceId ?? 'default',
+        detail: `double_facts_fence (${fenceCount} fences)${opts.sourcePath ? ` file=${opts.sourcePath}` : ''}`,
+      });
+      return {
+        slug,
+        status: 'skipped',
+        chunks: 0,
+        error: `DOUBLE_FACTS_FENCE: page '${slug}' has ${fenceCount} facts fences; exactly one is allowed. Merge them into one fence and re-sync.`,
+      };
+    }
+  }
   if (opts.refuseDestructiveShrink && existing) {
     const before = nonFenceContent(existing.compiled_truth, existing.timeline);
     const after = nonFenceContent(parsed.compiled_truth, parsed.timeline);
-    // after === '': a file emptied on purpose is a deliberate clear (the
-    // allowEmptyOverwrite contract above) — the wipe shape this guards is a
-    // stub with a title heading, not an empty body.
-    if (after.length > 0 && isDestructiveShrink(before, after)) {
+    // A file whose parsed body AND timeline are literally empty is a
+    // deliberate clear (the allowEmptyOverwrite contract above). A file that
+    // still carries a fence but lost all prose is NOT (Codex wipe-patch r1
+    // P1-1) — that is the wipe shape, so it goes through the guard.
+    const deliberateClear = `${parsed.compiled_truth}${parsed.timeline ?? ''}`.trim() === '';
+    if (!deliberateClear && isDestructiveShrink(before, after)) {
       const { logContentGuardEvent } = await import('./facts/content-guard-audit.ts');
       logContentGuardEvent({
         kind: 'shrink_blocked',

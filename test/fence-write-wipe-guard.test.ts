@@ -27,7 +27,7 @@ import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { writeFactsToFence } from '../src/core/facts/fence-write.ts';
 import type { FenceInputFact } from '../src/core/facts/fence-write.ts';
 import { readRecentContentGuardEvents } from '../src/core/facts/content-guard-audit.ts';
-import { assertSingleFactsFence, countFactsFences, nonFenceContent } from '../src/core/facts/content-preservation.ts';
+import { assertSingleFactsFence, countFactsFences, countGenuineFactsFences, nonFenceContent } from '../src/core/facts/content-preservation.ts';
 import { countDbOnlyPages } from '../src/core/facts/db-only-pages.ts';
 import { FACTS_FENCE_BEGIN, FACTS_FENCE_END, parseFactsFence } from '../src/core/facts-fence.ts';
 import { importFromFile } from '../src/core/import-file.ts';
@@ -366,5 +366,105 @@ describe('T5 — two facts fences hard-fail', () => {
     expect(readFileSync(filePath, 'utf-8')).toBe(doubled);
     expect(await factRows(slug)).toEqual(before);
     expect(eventsFor(slug).some((e) => e.kind === 'preservation_blocked' && /2 facts fences/.test(e.detail ?? ''))).toBe(true);
+  });
+});
+
+describe('Codex wipe-patch r1 regressions', () => {
+  test('P1-1: a fence-only file (all prose lost, fence kept) does not bypass the sync shrink guard', async () => {
+    const slug = 'people/dana-rich';
+    await seedDbOnlyPage(slug);
+    await writeFactsToFence(engine, target(slug), [fact('Dana joined Initech in 2021')]);
+    const filePath = join(brainDir, `${slug}.md`);
+    const fenceOnly = `---\ntype: person\ntitle: Dana Rich\n---\n\n${fenceBlock(readFileSync(filePath, 'utf-8'))}\n`;
+    writeFileSync(filePath, fenceOnly, 'utf-8');
+    const before = await engine.getPage(slug, { sourceId: 'default' });
+    const r = await importFromFile(engine, filePath, `${slug}.md`, { noEmbed: true, sourceId: 'default' });
+    expect(r.status).toBe('skipped');
+    expect(r.error).toContain('SHRINK_GUARD');
+    const after = await engine.getPage(slug, { sourceId: 'default' });
+    expect(after!.compiled_truth).toBe(before!.compiled_truth);
+  });
+
+  test('P1-1: a literally emptied file is still a deliberate clear', async () => {
+    const slug = 'people/dana-rich';
+    await seedDbOnlyPage(slug);
+    mkdirSync(join(brainDir, 'people'), { recursive: true });
+    const filePath = join(brainDir, `${slug}.md`);
+    writeFileSync(filePath, `---\ntype: person\ntitle: Dana Rich\n---\n`, 'utf-8');
+    const r = await importFromFile(engine, filePath, `${slug}.md`, { noEmbed: true, sourceId: 'default' });
+    expect(r.status).toBe('imported');
+  });
+
+  test('P1-2: double-fenced file → sync refuses; reconcile on a double-fenced DB body keeps fact ids', async () => {
+    const slug = 'people/double-sync';
+    await writeFactsToFence(engine, target(slug), [fact('First'), fact('Second')]);
+    const filePath = join(brainDir, `${slug}.md`);
+    await importFromFile(engine, filePath, `${slug}.md`, { noEmbed: true, sourceId: 'default' });
+    const ids = await factRows(slug);
+    expect(ids).toHaveLength(2);
+
+    const current = readFileSync(filePath, 'utf-8');
+    const fence = fenceBlock(current);
+    const oldFence = fence.replace(/\| 2 \|.*\n/, '');
+    const doubled = `---\ntype: person\ntitle: Double Sync\n---\n\n# Double Sync\n\n${RICH_BODY}\n\n## Facts\n\n${oldFence}\n\n## Facts\n\n${fence}\n`;
+    writeFileSync(filePath, doubled, 'utf-8');
+    const r = await importFromFile(engine, filePath, `${slug}.md`, { noEmbed: true, sourceId: 'default' });
+    expect(r.status).toBe('skipped');
+    expect(r.error).toContain('DOUBLE_FACTS_FENCE');
+    expect(eventsFor(slug).map((e) => e.kind)).toContain('double_fence_blocked');
+
+    // Even if a double-fenced body reaches the DB by another path, the
+    // reconcile refuses to act on it.
+    await engine.putPage(slug, { title: 'Double Sync', type: 'person', compiled_truth: `# Double Sync\n\n${oldFence}\n\n${fence}\n`, timeline: '', frontmatter: {} }, { sourceId: 'default' });
+    const rec = await runExtractFacts(engine, { slugs: [slug] });
+    expect(rec.factsDeleted).toBe(0);
+    expect(rec.warnings.join('\n')).toContain('DOUBLE_FACTS_FENCE');
+    expect(await factRows(slug)).toEqual(ids);
+  });
+
+  test('P1-2: a marker mentioned inside a code block is not counted as a fence', () => {
+    const one = `${FACTS_FENCE_BEGIN}\n| # | claim | kind |\n${FACTS_FENCE_END}`;
+    const doc = `# Docs\n\n\`\`\`markdown\n${FACTS_FENCE_BEGIN}\n\`\`\`\n\n${one}\n`;
+    expect(countGenuineFactsFences(doc)).toBe(1);
+  });
+
+  test('P1-3: an existing malformed fence row is never dropped by an append; disk, DB and ids unchanged', async () => {
+    const slug = 'people/malformed';
+    await writeFactsToFence(engine, target(slug), [fact('Good row')]);
+    const filePath = join(brainDir, `${slug}.md`);
+    await importFromFile(engine, filePath, `${slug}.md`, { noEmbed: true, sourceId: 'default' });
+    // Hand-edit a second row with an invalid row_num into the fence.
+    const bad = readFileSync(filePath, 'utf-8').replace(
+      FACTS_FENCE_END,
+      `| x | Bad row | fact | 1.0 | world | medium | 2026-01-01 |  | s |  |\n${FACTS_FENCE_END}`,
+    );
+    writeFileSync(filePath, bad, 'utf-8');
+    const ids = await factRows(slug);
+    const pageBefore = await engine.getPage(slug, { sourceId: 'default' });
+
+    const r = await writeFactsToFence(engine, target(slug), [fact('Another row')]);
+    expect(r.preservationGuardBlocked).toBe(true);
+    expect(r.fenceWriteFailed).toBe(true);
+    expect(readFileSync(filePath, 'utf-8')).toBe(bad);
+    expect(await factRows(slug)).toEqual(ids);
+    expect((await engine.getPage(slug, { sourceId: 'default' }))!.compiled_truth).toBe(pageBefore!.compiled_truth);
+  });
+
+  test('P2: DB-only page with a bare ## Timeline section inside compiled_truth still materializes', async () => {
+    const slug = 'people/bare-timeline';
+    await engine.putPage(slug, {
+      title: 'Bare Timeline',
+      type: 'person',
+      compiled_truth: '# Bare Timeline\n\nIntro prose about the person.\n\n## Timeline\n\n- **2026-01-02** | Met.\n\n## Background\n\nWorked at Hooli.',
+      timeline: '',
+      frontmatter: {},
+    }, { sourceId: 'default' });
+    const r = await writeFactsToFence(engine, target(slug), [fact('Bare Timeline likes tea')]);
+    expect(r.preservationGuardBlocked).toBeUndefined();
+    expect(r.inserted).toBe(1);
+    const file = readFileSync(join(brainDir, `${slug}.md`), 'utf-8');
+    expect(file).toContain('Intro prose about the person.');
+    expect(file).toContain('Met.');
+    expect(file).toContain('Worked at Hooli.');
   });
 });
