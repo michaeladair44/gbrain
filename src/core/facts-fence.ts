@@ -169,26 +169,6 @@ function parseForgottenFromContext(context: string | undefined): boolean {
 }
 
 /**
- * Nonblank lines inside the (first) facts fence that parseFactsFence skips
- * WITHOUT a warning because they are not table rows at all (e.g. a hand-edit
- * that lost a row's leading `|`). upsertFactRow re-renders the fence from the
- * parsed rows only, so such a line would vanish on the next append with no
- * warning to stop it (Codex wipe-patch r2 P1-2). Same fence selection as
- * parseFactsFence.
- */
-export function unparsedFactsFenceLines(body: string): string[] {
-  const beginIdx = body.indexOf(FACTS_FENCE_BEGIN);
-  if (beginIdx === -1) return [];
-  const endIdx = body.indexOf(FACTS_FENCE_END, beginIdx + FACTS_FENCE_BEGIN.length);
-  if (endIdx === -1) return [];
-  return body
-    .slice(beginIdx + FACTS_FENCE_BEGIN.length, endIdx)
-    .split('\n')
-    .filter((line) => line.trim() !== '' && !parseRowCells(line))
-    .map((line) => line.trim());
-}
-
-/**
  * Slice the body between the fence markers and parse the table.
  * Returns empty facts + empty warnings when no fence is present.
  *
@@ -222,7 +202,16 @@ export function parseFactsFence(body: string): FactsFenceParseResult {
     const line = lines[i];
     if (!line.trim()) continue;
     const cells = parseRowCells(line);
-    if (!cells) continue;
+    if (!cells) {
+      // Not a table row at all (e.g. a hand-edit that lost the row's leading
+      // `|`). Every fence rewriter re-renders from the parsed rows only, and
+      // extract_facts reconciles from them, so a line skipped here would be
+      // deleted downstream with no signal. Warn so the whole fence reads as
+      // non-authoritative and every caller fails closed (Codex wipe-patch
+      // r1-r3: the same loss surfaced at append, parse and reconcile).
+      warnings.push(`FACTS_FENCE_UNPARSED_LINE: "${line.trim()}"`);
+      continue;
+    }
 
     // Header row: cells include 'claim' and 'kind' (case-insensitive).
     if (!sawHeader) {
@@ -531,7 +520,12 @@ export function upsertFactRow(
     active?: boolean;
   },
 ): { body: string; rowNum: number } {
-  const { facts } = parseFactsFence(body);
+  const { facts, warnings } = parseFactsFence(body);
+  // Re-rendering a fence that did not parse cleanly drops the skipped rows.
+  // Refuse and leave the body untouched; callers surface the error.
+  if (warnings.length > 0) {
+    throw new Error(`upsertFactRow: existing facts fence is malformed; repair it before appending (${warnings.join('; ')})`);
+  }
   const nextRowNum = newRow.rowNum
     ?? (facts.length > 0 ? Math.max(...facts.map(f => f.rowNum)) + 1 : 1);
 

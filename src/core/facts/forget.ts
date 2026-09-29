@@ -77,6 +77,9 @@ export function supersededFact(fact: ParsedFact, today: string, newRowNum: numbe
  */
 export function strikeFenceRow(body: string, rowNum: number, strike: (fact: ParsedFact) => ParsedFact): string | null {
   const parsed = parseFactsFence(body);
+  // Re-rendering a fence that did not parse cleanly would drop the skipped
+  // rows; leave the markdown alone and fall back to the DB-only expire.
+  if (parsed.warnings.length > 0) return null;
   const target = parsed.facts.find(f => f.rowNum === rowNum);
   if (!target) return null;
   const updated: ParsedFact[] = parsed.facts.map(f => f.rowNum === rowNum ? strike(f) : f);

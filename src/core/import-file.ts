@@ -55,7 +55,7 @@ import { warnOncePerProcess, validateSlug, contentHash, contentHashLegacy, ATOMS
 import { decorateEmbeddingDimError } from './embedding-dim-check.ts';
 import { resolveImportContextualMode } from './import-contextual-mode.ts';
 import { runGuardrails } from './guardrails.ts';
-import { parseFactsFence, renderFactsTable, restoreHiddenFactRows, factsGapWarning, replaceOrInsertFactsFence } from './facts-fence.ts';
+import { parseFactsFence, renderFactsTable, restoreHiddenFactRows, factsGapWarning, replaceOrInsertFactsFence, FACTS_FENCE_BEGIN, FACTS_FENCE_END } from './facts-fence.ts';
 import { nonFenceContent, isDestructiveShrink, countFactsFenceMarkers } from './facts/content-preservation.ts';
 
 /**
@@ -95,9 +95,31 @@ function mergeHiddenFactRowsIntoBody(
     // sentinel here, so this is dedup, not a behaviour change for the importer).
     return replaceOrInsertFactsFence(incomingBody, renderFactsTable(merge.merged));
   }
+  // The existing fence did not parse cleanly, so remote readers never saw it
+  // (the fence is omitted on read) and cannot have edited it. Keep it
+  // verbatim instead of letting the incoming write drop its rows.
+  if (existingFacts.warnings.length > 0) {
+    const existingFence = rawFactsFenceBlock(existingBody);
+    if (existingFence !== null && rawFactsFenceBlock(incomingBody) !== existingFence) {
+      console.warn(
+        `[gbrain] facts fence on ${slug} is malformed (${existingFacts.warnings.join('; ')}); ` +
+        `kept it unchanged and ignored the incoming fence. Repair the fence in the markdown file.`,
+      );
+      return replaceOrInsertFactsFence(incomingBody, existingFence);
+    }
+  }
   const gapWarning = factsGapWarning(slug, incomingFacts, existingFacts, false);
   if (gapWarning) console.warn(gapWarning);
   return incomingBody;
+}
+
+/** The first facts fence block (markers included) as raw text, or null. */
+function rawFactsFenceBlock(body: string): string | null {
+  const begin = body.indexOf(FACTS_FENCE_BEGIN);
+  if (begin === -1) return null;
+  const end = body.indexOf(FACTS_FENCE_END, begin + FACTS_FENCE_BEGIN.length);
+  if (end === -1) return null;
+  return body.slice(begin, end + FACTS_FENCE_END.length);
 }
 
 /**

@@ -48,7 +48,7 @@ import { assertSourceFilesystemActive, hasSourceFilesystemLock, withSourceFilesy
 import { gbrainPath } from '../config.ts';
 import { isWriteThroughDisabled, resolvePageWriteTarget } from '../write-through.ts';
 import { isDurabilityHardened, commitWriteThroughFile } from '../brain-repo-durability.ts';
-import { upsertFactRow, parseFactsFence, formatFenceDate, unparsedFactsFenceLines } from '../facts-fence.ts';
+import { upsertFactRow, parseFactsFence, formatFenceDate } from '../facts-fence.ts';
 import { contentHash } from '../utils.ts';
 import { extractFactsFromFenceText } from './extract-from-fence.ts';
 import { logStubGuardEvent } from './stub-guard-audit.ts';
@@ -497,14 +497,10 @@ export async function writeFactsToFence(
       // recovered rows, silently dropping any row the parser skipped; the
       // mirror + next reconcile would then delete that fact. A page whose
       // existing fence doesn't parse cleanly is not safe to append to.
-      //
-      //    Lines the parser skips with NO warning (not a table row at all,
-      //    e.g. a row that lost its leading `|`) are just as lost on
-      //    re-render, so they count too (Codex wipe-patch r2 P1-2).
-      const originalFenceWarnings = [
-        ...parseFactsFence(body).warnings,
-        ...unparsedFactsFenceLines(body).map((line) => `FACTS_FENCE_UNPARSED_LINE: "${line}"`),
-      ];
+      //    Lines that are not table rows at all (e.g. a row that lost its
+      //    leading `|`) warn as FACTS_FENCE_UNPARSED_LINE, so they count too
+      //    (Codex wipe-patch r2 P1-2).
+      const originalFenceWarnings = parseFactsFence(body).warnings;
       if (originalFenceWarnings.length > 0) {
         recordWriteFailure(
           target.slug, target.sourceId,

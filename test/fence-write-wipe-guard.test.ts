@@ -29,8 +29,9 @@ import type { FenceInputFact } from '../src/core/facts/fence-write.ts';
 import { readRecentContentGuardEvents } from '../src/core/facts/content-guard-audit.ts';
 import { assertSingleFactsFence, countFactsFenceMarkers, nonFenceContent } from '../src/core/facts/content-preservation.ts';
 import { countDbOnlyPages } from '../src/core/facts/db-only-pages.ts';
-import { FACTS_FENCE_BEGIN, FACTS_FENCE_END, parseFactsFence } from '../src/core/facts-fence.ts';
-import { importFromFile } from '../src/core/import-file.ts';
+import { FACTS_FENCE_BEGIN, FACTS_FENCE_END, parseFactsFence, renderFactsTable, upsertFactRow } from '../src/core/facts-fence.ts';
+import { importFromContent, importFromFile } from '../src/core/import-file.ts';
+import { forgetFactInFence } from '../src/core/facts/forget.ts';
 import { parseMarkdown } from '../src/core/markdown.ts';
 import { runExtractFacts } from '../src/core/cycle/extract-facts.ts';
 import { _resetWriteThroughCacheForTest } from '../src/core/write-through.ts';
@@ -540,5 +541,82 @@ describe('Codex wipe-patch r2 regressions', () => {
     expect(rec.factsDeleted).toBe(0);
     expect(rec.warnings.join('\n')).toContain('FACTS_FENCE_UNPARSED_LINE');
     expect(await factRows(slug)).toEqual(ids);
+  });
+});
+
+// Codex wipe-patch r4: the malformed-row class, fixed at the parser. A fence
+// line that is not a table row warns, so every path that rewrites or
+// reconciles a fence sees a non-authoritative parse and fails closed.
+describe('Codex wipe-patch r4 — malformed fence rows fail closed on every path', () => {
+  const brokenFence = async (slug: string) => {
+    await writeFactsToFence(engine, target(slug), [fact('Keep one'), fact('Keep two')]);
+    const filePath = join(brainDir, `${slug}.md`);
+    await importFromFile(engine, filePath, `${slug}.md`, { noEmbed: true, sourceId: 'default' });
+    const ids = await factRows(slug);
+    expect(ids).toHaveLength(2);
+    const bad = readFileSync(filePath, 'utf-8').replace(/\n\| 2 \|/, '\n2 |');
+    writeFileSync(filePath, bad, 'utf-8');
+    return { filePath, bad, ids };
+  };
+
+  test('parse: a pipe-less fence line warns FACTS_FENCE_UNPARSED_LINE; a rendered fence parses clean', () => {
+    const clean = renderFactsTable([
+      { rowNum: 1, claim: 'A', kind: 'fact', confidence: 1, visibility: 'world', notability: 'high', active: true },
+    ]);
+    expect(parseFactsFence(clean).warnings).toEqual([]);
+    const bad = clean.replace('\n| 1 |', '\n1 |');
+    const parsed = parseFactsFence(bad);
+    expect(parsed.facts).toHaveLength(0);
+    expect(parsed.warnings.some((w) => w.startsWith('FACTS_FENCE_UNPARSED_LINE'))).toBe(true);
+  });
+
+  test('upsertFactRow refuses to re-render a fence with a pipe-less row', () => {
+    const clean = renderFactsTable([
+      { rowNum: 1, claim: 'A', kind: 'fact', confidence: 1, visibility: 'world', notability: 'high', active: true },
+      { rowNum: 2, claim: 'B', kind: 'fact', confidence: 1, visibility: 'world', notability: 'high', active: true },
+    ]);
+    const bad = clean.replace('\n| 2 |', '\n2 |');
+    expect(() => upsertFactRow(bad, {
+      claim: 'C', kind: 'fact', confidence: 1, visibility: 'world', notability: 'high',
+    })).toThrow(/malformed/);
+  });
+
+  test('sync: importing a file with a pipe-less row keeps the line verbatim in the DB body', async () => {
+    const slug = 'people/r4-sync';
+    const { filePath } = await brokenFence(slug);
+    const imp = await importFromFile(engine, filePath, `${slug}.md`, { noEmbed: true, sourceId: 'default' });
+    expect(imp.status).toBe('imported');
+    expect((await engine.getPage(slug, { sourceId: 'default' }))!.compiled_truth).toContain('\n2 |');
+  });
+
+  test('forget: a fence with a pipe-less row is not rewritten; the markdown keeps both rows', async () => {
+    const slug = 'people/r4-forget';
+    const { filePath, bad, ids } = await brokenFence(slug);
+    await forgetFactInFence(engine, ids[0].id, { reason: 'test' });
+    expect(readFileSync(filePath, 'utf-8')).toBe(bad);
+    const rows = await factRows(slug);
+    expect(rows.map((r) => r.id)).toEqual(ids.map((r) => r.id));
+  });
+
+  test('remote write-back: a malformed existing fence is kept verbatim, not replaced by the incoming body', async () => {
+    const slug = 'people/r4-remote';
+    const { bad, ids } = await brokenFence(slug);
+    await importFromFile(engine, join(brainDir, `${slug}.md`), `${slug}.md`, { noEmbed: true, sourceId: 'default' });
+    const before = (await engine.getPage(slug, { sourceId: 'default' }))!.compiled_truth;
+    const existingFence = fenceBlock(before);
+    expect(existingFence).toContain('\n2 |');
+
+    // A remote caller never sees a malformed fence (it is omitted on read),
+    // so its write-back carries no fence at all.
+    const incoming = parseMarkdown(bad, `${slug}.md`);
+    const noFence = bad.replace(fenceBlock(bad), '');
+    await importFromContent(engine, slug, noFence, { noEmbed: true, sourceId: 'default', remote: true } as never);
+    const after = (await engine.getPage(slug, { sourceId: 'default' }))!.compiled_truth;
+    expect(fenceBlock(after)).toBe(existingFence);
+    expect(incoming.compiled_truth).toContain('\n2 |');
+
+    const rec = await runExtractFacts(engine, { slugs: [slug] });
+    expect(rec.factsDeleted).toBe(0);
+    expect((await factRows(slug)).map((r) => r.id)).toEqual(ids.map((r) => r.id));
   });
 });
