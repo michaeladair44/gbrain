@@ -193,6 +193,7 @@ export const CWD_DOTENV_PROTECTED_KEYS: readonly string[] = [
   'GBRAIN_ALLOW_UNVERIFIED_REMOTE',  // skips remote verification on workspace push
   'GBRAIN_GIT_ALLOW_FILE_TRANSPORT', // permits the git file:// transport
   'GBRAIN_ALLOW_MASS_RECONCILE',     // lifts the mass-delete reconcile guard
+  'GBRAIN_ALLOW_SHRINK',             // lifts the sync shrink guard (wipe-patch: page-wipe incident 2026-09-24)
   'GBRAIN_ALLOW_DEFAULT_WRITE',      // permits writes into the 'default' source
   'GBRAIN_NO_SANITY',                // disables content sanity checks
   'GBRAIN_REMOTE_PRIVATE_PAGES',     // exposes private pages to remote callers

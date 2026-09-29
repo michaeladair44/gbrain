@@ -4217,21 +4217,21 @@
         "kind": "variable",
         "name": "importFile",
         "signature": [
-          "(engine: BrainEngine, filePath: string, relativePath: string, opts?: { noEmbed?: boolean; inferFrontmatter?: boolean; sourceId?: string; forceRechunk?: boolean; activePack?: { page_types: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string>; aliases?: ReadonlyArray<string>; }>; }; firstCommitAt?: Date; }) => Promise<ImportResult>"
+          "(engine: BrainEngine, filePath: string, relativePath: string, opts?: { noEmbed?: boolean; inferFrontmatter?: boolean; sourceId?: string; forceRechunk?: boolean; activePack?: { page_types: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string>; aliases?: ReadonlyArray<string>; }>; }; firstCommitAt?: Date; allowShrink?: boolean; }) => Promise<ImportResult>"
         ]
       },
       {
         "kind": "function",
         "name": "importFromContent",
         "signature": [
-          "(engine: BrainEngine, slug: string, content: string, opts?: { prepare?: (prepared: PreparedContentImport) => Promise<ImportResult>; prepareFrontmatter?: (page: ParsedPage) => void; noEmbed?: boolean; sourceId?: string; filename?: string; sourcePath?: string; sourceRoot?: string; fileTimes?: { birthtime?: Date; mtime?: Date; firstCommit?: Date; }; forceRechunk?: boolean; activePack?: { page_types: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string>; aliases?: ReadonlyArray<string>; }>; }; source_kind?: string | null; source_uri?: string | null; ingested_via?: string | null; remote?: boolean; allowEmptyOverwrite?: boolean; beforeCommit?: (tx: BrainEngine, slug: string) => Promise<void>; onPostCommitEmbedding?: (complete: () => Promise<ImportEmbeddingResult>) => void; }) => Promise<ImportResult>"
+          "(engine: BrainEngine, slug: string, content: string, opts?: { prepare?: (prepared: PreparedContentImport) => Promise<ImportResult>; prepareFrontmatter?: (page: ParsedPage) => void; noEmbed?: boolean; sourceId?: string; filename?: string; sourcePath?: string; sourceRoot?: string; fileTimes?: { birthtime?: Date; mtime?: Date; firstCommit?: Date; }; forceRechunk?: boolean; activePack?: { page_types: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string>; aliases?: ReadonlyArray<string>; }>; }; source_kind?: string | null; source_uri?: string | null; ingested_via?: string | null; remote?: boolean; allowEmptyOverwrite?: boolean; refuseDestructiveShrink?: boolean; beforeCommit?: (tx: BrainEngine, slug: string) => Promise<void>; onPostCommitEmbedding?: (complete: () => Promise<ImportEmbeddingResult>) => void; }) => Promise<ImportResult>"
         ]
       },
       {
         "kind": "function",
         "name": "importFromFile",
         "signature": [
-          "(engine: BrainEngine, filePath: string, relativePath: string, opts?: { noEmbed?: boolean; inferFrontmatter?: boolean; sourceId?: string; forceRechunk?: boolean; activePack?: { page_types: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string>; aliases?: ReadonlyArray<string>; }>; }; firstCommitAt?: Date; }) => Promise<ImportResult>"
+          "(engine: BrainEngine, filePath: string, relativePath: string, opts?: { noEmbed?: boolean; inferFrontmatter?: boolean; sourceId?: string; forceRechunk?: boolean; activePack?: { page_types: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string>; aliases?: ReadonlyArray<string>; }>; }; firstCommitAt?: Date; allowShrink?: boolean; }) => Promise<ImportResult>"
         ]
       },
       {

@@ -40,7 +40,7 @@ import { dirname, isAbsolute, relative } from 'node:path';
 
 import type { BrainEngine, NewFact, FactVisibility, FactKind } from '../engine.ts';
 import type { ResolutionSource } from '../entities/resolve.ts';
-import { inferTypeFromPack, parseMarkdown } from '../markdown.ts';
+import { inferTypeFromPack, parseMarkdown, serializePageToMarkdown } from '../markdown.ts';
 import { sanitizeText } from '../batch-rows.ts';
 import { loadActivePackBestEffort } from '../schema-pack/best-effort.ts';
 import { withPageLock } from '../page-lock.ts';
@@ -54,6 +54,8 @@ import { extractFactsFromFenceText } from './extract-from-fence.ts';
 import { logStubGuardEvent } from './stub-guard-audit.ts';
 import { isFactWithdrawn } from './withdrawal.ts';
 import { managedPersistenceEnabled } from '../persistence/ownership.ts';
+import { logContentGuardEvent } from './content-guard-audit.ts';
+import { nonFenceContent, isDestructiveShrink, countFactsFences } from './content-preservation.ts';
 
 /** Resolved source binding for the entity page. */
 export interface FenceTarget {
@@ -135,6 +137,16 @@ export interface FenceWriteResult {
    * refusal writePageThrough applies (#2018 `repo_not_found`).
    */
   targetUnresolvable?: true;
+  /**
+   * Page-wipe incident (2026-09-24): true when the pre-rename preservation
+   * guard refused the write because the candidate file would drop existing
+   * non-fence body/timeline content (vs the pre-write file, or vs the DB row
+   * for a DB-only page), or would shrink the DB row's content by more than
+   * half through the #4872 mirror. Always paired with `fenceWriteFailed`, so
+   * every caller treats it as a hard failure: disk, DB body and fact rows are
+   * untouched, the candidate stays at `<file>.tmp` as quarantine evidence.
+   */
+  preservationGuardBlocked?: true;
 }
 
 const FAILURE_LOG_PATH = (): string => gbrainPath('facts.write_failures.jsonl');
@@ -349,10 +361,40 @@ export async function writeFactsToFence(
       facts = kept;
       if (!facts.length) return { inserted: 0, ids: [], ...withdrawnSkipped };
 
-      // 1. Read existing body or stub-create.
+      // 1. Read existing body, materialize a DB-only page, or stub-create.
+      //
+      // The DB row is read up front: it is the baseline for the
+      // pre-rename preservation guard (step 4b) and, when no file exists,
+      // the content to materialize. Page-wipe incident 2026-09-24: this
+      // branch used to stub-create over pages that existed only in the DB,
+      // and the #4872 mirror then copied the stub body over the DB row.
+      let existingRow: Awaited<ReturnType<BrainEngine['getPage']>>;
+      try {
+        existingRow = await engine.getPage(target.slug, { sourceId: target.sourceId });
+      } catch (err) {
+        // Can't prove there is no DB row → can't prove a stub is safe.
+        const msg = err instanceof Error ? err.message : String(err);
+        recordWriteFailure(target.slug, target.sourceId, [`preservation_guard_db_read_failed: ${msg}`], filePath);
+        return { inserted: 0, ids: [], fenceWriteFailed: true, preservationGuardBlocked: true };
+      }
       let body: string;
+      let baseline: { text: string; source: 'file' | 'db' } | null = null;
       if (existsSync(filePath)) {
         body = readFileSync(filePath, 'utf-8');
+        const pre = parseMarkdown(body, `${target.slug}.md`);
+        baseline = { text: nonFenceContent(pre.compiled_truth, pre.timeline), source: 'file' };
+      } else if (existingRow) {
+        // DB-only page: materialize the DB body + timeline to disk, then
+        // append the fence to it. Never stub over a live row. The DB row
+        // is a verified live page, so neither stub-guard arm applies.
+        // Tags are source-scoped and not on the Page row (C7).
+        const tags = await engine.getTags(target.slug, { sourceId: target.sourceId });
+        body = serializePageToMarkdown(existingRow, tags);
+        baseline = {
+          text: nonFenceContent(existingRow.compiled_truth, existingRow.timeline),
+          source: 'db',
+        };
+        mkdirSync(dirname(filePath), { recursive: true });
       } else {
         // Stub-creation guard, two arms:
         //
@@ -496,6 +538,65 @@ export async function writeFactsToFence(
       if (parsed.warnings.length > 0) {
         recordWriteFailure(target.slug, target.sourceId, parsed.warnings, filePath);
         return { inserted: 0, ids: [], fenceWriteFailed: true };
+      }
+
+      // 4b. Pre-rename preservation guard (page-wipe incident 2026-09-24,
+      //     Codex C8). Runs BEFORE the canonical rename, the DB mirror and
+      //     the fact insert, outside the mirror's swallowed catch — a guard
+      //     in the mirror fires after the destructive file is already the
+      //     file of record. Two checks, both under parser normalization:
+      //       (i)  a fact append keeps ALL existing non-fence body + timeline
+      //            content of its baseline (the pre-write file, or the DB row
+      //            it materialized) — the candidate may only add/replace the
+      //            fence;
+      //       (ii) the #4872 mirror below must not shrink the DB row's
+      //            non-fence content by more than half (a stub file sitting
+      //            over a rich DB-only row).
+      //     On failure the candidate stays at .tmp (quarantine), the
+      //     failure is logged to both JSONL surfaces, and nothing else moves.
+      const candidateParsed = parseMarkdown(tmpBody, `${target.slug}.md`);
+      const candidateText = nonFenceContent(candidateParsed.compiled_truth, candidateParsed.timeline);
+      const dbText = existingRow ? nonFenceContent(existingRow.compiled_truth, existingRow.timeline) : '';
+      let blockReason: string | null = null;
+      let blockBaseline: { text: string; source: 'file' | 'db' } | null = null;
+      const baselineFences = countFactsFences(tmpBody);
+      if (baselineFences > 1) {
+        // Double-fence trap: upsertFactRow only touched the first fence; the
+        // reconcile would treat the other fence's rows as stale.
+        blockReason = `page has ${baselineFences} facts fences; exactly one is allowed`;
+        blockBaseline = baseline ?? { text: dbText, source: 'db' };
+      } else if (baseline && candidateText !== baseline.text) {
+        blockReason = `fact append would change existing non-fence content (baseline=${baseline.source})`;
+        blockBaseline = baseline;
+      } else if (existingRow && isDestructiveShrink(dbText, candidateText)) {
+        blockReason = 'mirror would shrink the DB page body by more than half';
+        blockBaseline = { text: dbText, source: 'db' };
+      }
+      if (blockReason && blockBaseline) {
+        recordWriteFailure(target.slug, target.sourceId, [`preservation_guard: ${blockReason}`], filePath);
+        logContentGuardEvent({
+          kind: 'preservation_blocked',
+          slug: target.slug,
+          source_id: target.sourceId,
+          baseline: blockBaseline.source,
+          before_chars: blockBaseline.text.length,
+          after_chars: candidateText.length,
+          detail: blockReason,
+        });
+        // eslint-disable-next-line no-console
+        console.warn(
+          `[facts] preservation guard refused fence write for ${target.slug}: ${blockReason}; candidate quarantined at ${tmpPath}`,
+        );
+        return { inserted: 0, ids: [], fenceWriteFailed: true, preservationGuardBlocked: true };
+      }
+      if (!existsSync(filePath)) {
+        logContentGuardEvent({
+          kind: existingRow ? 'materialized_from_db' : 'stub_created',
+          slug: target.slug,
+          source_id: target.sourceId,
+          before_chars: dbText.length,
+          after_chars: candidateText.length,
+        });
       }
 
       // 5. Rename .tmp → file. POSIX atomic; the canonical file is

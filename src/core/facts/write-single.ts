@@ -213,6 +213,13 @@ export async function writeSingleFact(
       ],
     );
 
+    if (result.preservationGuardBlocked) {
+      // The write would have destroyed existing page prose (page-wipe
+      // incident 2026-09-24). Hard failure, same as a parse rejection.
+      throw new Error(
+        `facts fence write refused for ${resolvedSlug} — it would drop existing page content; candidate quarantined as .tmp, see the facts write-failure JSONL log`,
+      );
+    }
     if (result.fenceWriteFailed) {
       // Parse-validate rejected the .tmp (quarantined). Hard failure — do NOT
       // fall through to a DB row whose fence is broken (pipeline policy).

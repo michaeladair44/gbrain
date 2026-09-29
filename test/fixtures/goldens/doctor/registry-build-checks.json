@@ -127,6 +127,14 @@
       },
       {
         "category": "brain",
+        "name": "content_guard_24h"
+      },
+      {
+        "category": "brain",
+        "name": "db_only_pages"
+      },
+      {
+        "category": "brain",
         "name": "sync_failures"
       },
       {

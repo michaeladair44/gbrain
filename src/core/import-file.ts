@@ -56,6 +56,7 @@ import { decorateEmbeddingDimError } from './embedding-dim-check.ts';
 import { resolveImportContextualMode } from './import-contextual-mode.ts';
 import { runGuardrails } from './guardrails.ts';
 import { parseFactsFence, renderFactsTable, restoreHiddenFactRows, factsGapWarning, replaceOrInsertFactsFence } from './facts-fence.ts';
+import { nonFenceContent, isDestructiveShrink } from './facts/content-preservation.ts';
 
 /**
  * #2044 / #4548: row-level, visibility-aware fence merge for one page
@@ -301,6 +302,16 @@ export async function importFromContent(
      * and reindex leave it unset so the guard stays armed.
      */
     allowEmptyOverwrite?: boolean;
+    /**
+     * Sync-side shrink guard (page-wipe incident 2026-09-24). When `true`,
+     * refuse (status 'skipped' + error, so sync feeds the failure ledger and
+     * does not checkpoint the path) an import that would shrink an existing
+     * page's non-fence body + timeline by more than half. Only
+     * `importFromFile` sets it — a stub file sitting over a rich DB row must
+     * not silently overwrite the row. Bypass: the sync allow-shrink flag
+     * or GBRAIN_ALLOW_SHRINK=1.
+     */
+    refuseDestructiveShrink?: boolean;
     beforeCommit?: (tx: BrainEngine, slug: string) => Promise<void>;
     onPostCommitEmbedding?: (complete: () => Promise<ImportEmbeddingResult>) => void;
   } = {},
@@ -722,6 +733,34 @@ export async function importFromContent(
       await persistUnchanged(true);
       const resealed = await projectionBelowSafeFence(engine, existing.id) ? await resealSafeChunks(engine, slug, sourceId ?? 'default') : null;
       return { slug, status: 'skipped', chunks: 0, parsedPage, ...(typeWarning ? { type_warning: typeWarning } : {}), ...(resealed ? { resealed } : {}) };
+    }
+  }
+
+  if (opts.refuseDestructiveShrink && existing) {
+    const before = nonFenceContent(existing.compiled_truth, existing.timeline);
+    const after = nonFenceContent(parsed.compiled_truth, parsed.timeline);
+    // after === '': a file emptied on purpose is a deliberate clear (the
+    // allowEmptyOverwrite contract above) — the wipe shape this guards is a
+    // stub with a title heading, not an empty body.
+    if (after.length > 0 && isDestructiveShrink(before, after)) {
+      const { logContentGuardEvent } = await import('./facts/content-guard-audit.ts');
+      logContentGuardEvent({
+        kind: 'shrink_blocked',
+        slug,
+        source_id: sourceId ?? 'default',
+        baseline: 'db',
+        before_chars: before.length,
+        after_chars: after.length,
+        detail: opts.sourcePath ? `file=${opts.sourcePath}` : undefined,
+      });
+      return {
+        slug,
+        status: 'skipped',
+        chunks: 0,
+        error:
+          `SHRINK_GUARD: refusing to shrink page '${slug}' non-fence content from ${before.length} to ${after.length} chars ` +
+          `(>50% loss). If the file is correct, re-run the sync with GBRAIN_ALLOW_SHRINK=1 (see gbrain sync --help, allow-shrink).`,
+      };
     }
   }
 
@@ -1160,6 +1199,8 @@ export async function importFromFile(
     activePack?: { page_types: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string>; aliases?: ReadonlyArray<string> }> };
     /** Git first-commit date of the file (opt-in, see git-first-commit.ts); an undated page's fallback anchor. */
     firstCommitAt?: Date;
+    /** Bypass the shrink guard (see importFromContent `refuseDestructiveShrink`). */
+    allowShrink?: boolean;
   } = {},
 ): Promise<ImportResult> {
   // Defense-in-depth: reject symlinks before reading content.
@@ -1330,6 +1371,9 @@ export async function importFromFile(
     // The disk file IS the source of truth: a file the user emptied is a
     // deliberate clear, so it passes putPage's empty-overwrite guard.
     allowEmptyOverwrite: true,
+    // ...but a file that silently lost most of a rich page's prose (a
+    // stub written over a DB-only page) must not be mirrored into the DB.
+    refuseDestructiveShrink: !(opts.allowShrink || process.env.GBRAIN_ALLOW_SHRINK === '1'),
   });
 }
 

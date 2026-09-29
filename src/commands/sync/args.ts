@@ -69,6 +69,11 @@ Options:
   --watch              Re-sync continuously on an interval.
   --interval N         Watch-mode interval in seconds (default 60).
   --no-pull            Skip 'git pull' before the sync (useful for tests).
+  --allow-shrink       Let a file replace a page even when it drops more
+                       than half of the page's non-fence body + timeline
+                       (the SHRINK_GUARD failure). Same as GBRAIN_ALLOW_SHRINK=1.
+                       Not forwarded to a delegated 'gbrain serve' run;
+                       combine with --no-delegate.
   --no-delegate        On a PGLite brain with a live 'gbrain serve', sync
                        normally delegates the run to the serve process over
                        its IPC socket (the lock owner does the work; embeds
@@ -123,6 +128,9 @@ export function parseSyncFlags(args: string[]) {
   const dryRun = args.includes('--dry-run');
   const full = args.includes('--full');
   const noPull = args.includes('--no-pull');
+  // Page-wipe incident 2026-09-24: importFromFile's shrink guard reads this
+  // env var, so it reaches every import path this process runs.
+  if (args.includes('--allow-shrink')) process.env.GBRAIN_ALLOW_SHRINK = '1';
   let noEmbed = resolveNoEmbed(args, loadConfig());
   const noExtract = args.includes('--no-extract'); // v0.42.7 #1696
   const skipFailed = args.includes('--skip-failed');
