@@ -27,7 +27,7 @@ import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { writeFactsToFence } from '../src/core/facts/fence-write.ts';
 import type { FenceInputFact } from '../src/core/facts/fence-write.ts';
 import { readRecentContentGuardEvents } from '../src/core/facts/content-guard-audit.ts';
-import { assertSingleFactsFence, countFactsFences, countGenuineFactsFences, nonFenceContent } from '../src/core/facts/content-preservation.ts';
+import { assertSingleFactsFence, countFactsFenceMarkers, nonFenceContent } from '../src/core/facts/content-preservation.ts';
 import { countDbOnlyPages } from '../src/core/facts/db-only-pages.ts';
 import { FACTS_FENCE_BEGIN, FACTS_FENCE_END, parseFactsFence } from '../src/core/facts-fence.ts';
 import { importFromFile } from '../src/core/import-file.ts';
@@ -143,7 +143,7 @@ describe('T1 — DB-only page is materialized from the DB, not stubbed', () => {
     expect(file).toContain('Dana joined Initech in 2021');
     expect(file).toContain('company: Initech');
     expect(file).toContain('vip'); // source-scoped tags carried into frontmatter (C7)
-    expect(countFactsFences(file)).toBe(1);
+    expect(countFactsFenceMarkers(file)).toBe(1);
 
     // The fence lands in compiled_truth (above the timeline sentinel), so
     // the extract_facts reconcile can see it.
@@ -422,12 +422,6 @@ describe('Codex wipe-patch r1 regressions', () => {
     expect(await factRows(slug)).toEqual(ids);
   });
 
-  test('P1-2: a marker mentioned inside a code block is not counted as a fence', () => {
-    const one = `${FACTS_FENCE_BEGIN}\n| # | claim | kind |\n${FACTS_FENCE_END}`;
-    const doc = `# Docs\n\n\`\`\`markdown\n${FACTS_FENCE_BEGIN}\n\`\`\`\n\n${one}\n`;
-    expect(countGenuineFactsFences(doc)).toBe(1);
-  });
-
   test('P1-3: an existing malformed fence row is never dropped by an append; disk, DB and ids unchanged', async () => {
     const slug = 'people/malformed';
     await writeFactsToFence(engine, target(slug), [fact('Good row')]);
@@ -466,5 +460,66 @@ describe('Codex wipe-patch r1 regressions', () => {
     expect(file).toContain('Intro prose about the person.');
     expect(file).toContain('Met.');
     expect(file).toContain('Worked at Hooli.');
+  });
+});
+
+describe('Codex wipe-patch r2 regressions', () => {
+  const EXAMPLE = `${FACTS_FENCE_BEGIN}\n| # | claim | kind | confidence | visibility | notability | valid_from | valid_until | source | context |\n|---|---|---|---|---|---|---|---|---|---|\n| 1 | Example claim | fact | 1.0 | world | medium | 2026-01-01 |  | docs |  |\n${FACTS_FENCE_END}`;
+
+  test('P1-1: marker count is not code-block aware (matches parseFactsFence selection)', () => {
+    const doc = `# Docs\n\n\`\`\`markdown\n${EXAMPLE}\n\`\`\`\n\n${EXAMPLE}\n`;
+    expect(countFactsFenceMarkers(doc)).toBe(2);
+    expect(countFactsFenceMarkers(`# Docs\n\n${EXAMPLE}\n`)).toBe(1);
+    // A stray end marker makes the fence ambiguous too.
+    expect(countFactsFenceMarkers(`${EXAMPLE}\n\n${FACTS_FENCE_END}\n`)).toBe(2);
+    expect(() => assertSingleFactsFence(doc)).toThrow(/DOUBLE_FACTS_FENCE/);
+  });
+
+  test('P1-1: code-block example fence above the live fence → sync refuses, reconcile and writer keep live fact ids', async () => {
+    const slug = 'people/code-example';
+    await writeFactsToFence(engine, target(slug), [fact('Live one'), fact('Live two')]);
+    const filePath = join(brainDir, `${slug}.md`);
+    await importFromFile(engine, filePath, `${slug}.md`, { noEmbed: true, sourceId: 'default' });
+    const ids = await factRows(slug);
+    expect(ids).toHaveLength(2);
+
+    const live = fenceBlock(readFileSync(filePath, 'utf-8'));
+    const withExample = `---\ntype: person\ntitle: Code Example\n---\n\n# Code Example\n\n${RICH_BODY}\n\n\`\`\`markdown\n${EXAMPLE}\n\`\`\`\n\n## Facts\n\n${live}\n`;
+    writeFileSync(filePath, withExample, 'utf-8');
+
+    const r = await importFromFile(engine, filePath, `${slug}.md`, { noEmbed: true, sourceId: 'default' });
+    expect(r.status).toBe('skipped');
+    expect(r.error).toContain('DOUBLE_FACTS_FENCE');
+
+    const w = await writeFactsToFence(engine, target(slug), [fact('Live three')]);
+    expect(w.preservationGuardBlocked).toBe(true);
+    expect(readFileSync(filePath, 'utf-8')).toBe(withExample);
+
+    await engine.putPage(slug, { title: 'Code Example', type: 'person', compiled_truth: `# Code Example\n\n\`\`\`markdown\n${EXAMPLE}\n\`\`\`\n\n${live}\n`, timeline: '', frontmatter: {} }, { sourceId: 'default' });
+    const rec = await runExtractFacts(engine, { slugs: [slug] });
+    expect(rec.factsDeleted).toBe(0);
+    expect(rec.warnings.join('\n')).toContain('DOUBLE_FACTS_FENCE');
+    expect(await factRows(slug)).toEqual(ids);
+  });
+
+  test('P1-2: a fence row that lost its leading pipe (no parser warning) blocks the append; disk, DB and ids unchanged', async () => {
+    const slug = 'people/no-pipe';
+    await writeFactsToFence(engine, target(slug), [fact('Keep one'), fact('Keep two')]);
+    const filePath = join(brainDir, `${slug}.md`);
+    await importFromFile(engine, filePath, `${slug}.md`, { noEmbed: true, sourceId: 'default' });
+    const cur = readFileSync(filePath, 'utf-8');
+    const bad = cur.replace(/\n\| 2 \|/, '\n2 |');
+    expect(bad).not.toBe(cur);
+    writeFileSync(filePath, bad, 'utf-8');
+    const ids = await factRows(slug);
+    const pageBefore = await engine.getPage(slug, { sourceId: 'default' });
+
+    const r = await writeFactsToFence(engine, target(slug), [fact('Another')]);
+    expect(r.preservationGuardBlocked).toBe(true);
+    expect(r.fenceWriteFailed).toBe(true);
+    expect(readFileSync(filePath, 'utf-8')).toBe(bad);
+    expect(await factRows(slug)).toEqual(ids);
+    expect((await engine.getPage(slug, { sourceId: 'default' }))!.compiled_truth).toBe(pageBefore!.compiled_truth);
+    expect(eventsFor(slug).some((e) => e.kind === 'preservation_blocked' && /UNPARSED_LINE/.test(e.detail ?? ''))).toBe(true);
   });
 });

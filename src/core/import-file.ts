@@ -56,7 +56,7 @@ import { decorateEmbeddingDimError } from './embedding-dim-check.ts';
 import { resolveImportContextualMode } from './import-contextual-mode.ts';
 import { runGuardrails } from './guardrails.ts';
 import { parseFactsFence, renderFactsTable, restoreHiddenFactRows, factsGapWarning, replaceOrInsertFactsFence } from './facts-fence.ts';
-import { nonFenceContent, isDestructiveShrink, countGenuineFactsFences } from './facts/content-preservation.ts';
+import { nonFenceContent, isDestructiveShrink, countFactsFenceMarkers } from './facts/content-preservation.ts';
 
 /**
  * #2044 / #4548: row-level, visibility-aware fence merge for one page
@@ -741,7 +741,7 @@ export async function importFromContent(
     // only the FIRST fence, so the extract_facts reconcile would treat the
     // second fence's rows as stale and delete + reinsert them (new ids, lost
     // source_session). Refuse the file instead of importing it.
-    const fenceCount = countGenuineFactsFences(parsed.compiled_truth) + countGenuineFactsFences(parsed.timeline || '');
+    const fenceCount = countFactsFenceMarkers(parsed.compiled_truth) + countFactsFenceMarkers(parsed.timeline || '');
     if (fenceCount > 1) {
       const { logContentGuardEvent } = await import('./facts/content-guard-audit.ts');
       logContentGuardEvent({

@@ -46,13 +46,6 @@ export function isDestructiveShrink(before: string, after: string): boolean {
   return after.length * 2 < before.length;
 }
 
-/** Number of `## Facts` fence begin markers in `text`. */
-export function countFactsFences(text: string): number {
-  let n = 0;
-  for (let i = text.indexOf(FACTS_FENCE_BEGIN); i !== -1; i = text.indexOf(FACTS_FENCE_BEGIN, i + FACTS_FENCE_BEGIN.length)) n++;
-  return n;
-}
-
 /**
  * The double-fence trap: `parseFactsFence` reads only the FIRST fence, so a
  * page carrying an old fence above the current one makes the extract_facts
@@ -62,48 +55,32 @@ export function countFactsFences(text: string): number {
  * fence append) must hard-fail on more than one fence instead of guessing.
  */
 export function assertSingleFactsFence(text: string, label = 'page'): void {
-  const n = countFactsFences(text);
+  const n = countFactsFenceMarkers(text);
   if (n > 1) {
     throw new Error(`DOUBLE_FACTS_FENCE: ${label} has ${n} facts fences; exactly one is allowed`);
   }
 }
 
 /**
- * Count GENUINE facts fences: begin markers on their own line and outside
- * fenced code blocks (same scan as extract-facts.ts
- * timelineHasGenuineFactsFenceMarker), so a page that merely documents the
- * marker syntax in a code example is not treated as double-fenced.
+ * Facts-fence marker count used by every double-fence gate (import, the
+ * extract_facts reconcile, the fence writer): the larger of the raw begin
+ * and end marker counts, anywhere in `text` — code blocks included.
+ *
+ * Deliberately NOT code-block aware (Codex wipe-patch r2 P1-1):
+ * parseFactsFence and upsertFactRow select the fence by raw indexOf, so a
+ * marker quoted in a code example above the live fence IS the fence they
+ * read and rewrite. A gate that skipped code blocks would pass exactly the
+ * page the parser misreads. Any second marker is ambiguous → refuse; the
+ * cost is that a page documenting the marker syntax AND carrying a live
+ * fence must be fixed by hand, which never loses data.
  */
-export function countGenuineFactsFences(text: string): number {
-  if (!text.includes(FACTS_FENCE_BEGIN)) return 0;
-  const lines = text.split(/\r\n|\r|\n/);
-  const OPEN_RE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
-  const CLOSE_RE = /^ {0,3}(`{3,}|~{3,})[ \t]*$/;
-  let n = 0;
-  let i = 0;
-  while (i < lines.length) {
-    const line = lines[i]!;
-    const open = OPEN_RE.exec(line);
-    if (open) {
-      const marker = open[1]!;
-      const fenceChar = marker[0]!;
-      if (!(fenceChar === '`' && open[2]!.trim().includes('`'))) {
-        let j = i + 1;
-        for (; j < lines.length; j++) {
-          const close = CLOSE_RE.exec(lines[j]!);
-          if (close && close[1]![0] === fenceChar && close[1]!.length >= marker.length) {
-            j++;
-            break;
-          }
-        }
-        i = j;
-        continue;
-      }
-    }
-    if (line.trim() === FACTS_FENCE_BEGIN) n++;
-    i++;
-  }
-  return n;
+export function countFactsFenceMarkers(text: string): number {
+  const count = (marker: string) => {
+    let n = 0;
+    for (let i = text.indexOf(marker); i !== -1; i = text.indexOf(marker, i + marker.length)) n++;
+    return n;
+  };
+  return Math.max(count(FACTS_FENCE_BEGIN), count(FACTS_FENCE_END));
 }
 
 /**

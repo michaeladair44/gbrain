@@ -65,7 +65,7 @@ import {
 import { writeReceipt } from '../extract/receipt-writer.ts';
 import { classifyRunStop, upsertExtractRollup } from '../extract/rollup-writer.ts';
 import { parseFactsFence, FACTS_FENCE_BEGIN } from '../facts-fence.ts';
-import { countGenuineFactsFences } from '../facts/content-preservation.ts';
+import { countFactsFenceMarkers } from '../facts/content-preservation.ts';
 import {
   extractFactsFromFenceText,
   type FenceExtractedFact,
@@ -698,7 +698,7 @@ export async function runExtractFacts(
     // reads only the FIRST fence, so rows living in a second fence would be
     // read as deleted and the whole page wiped + reinserted (new ids, lost
     // source_session, broken supersession). Non-authoritative → preserve.
-    if (countGenuineFactsFences(body) > 1) {
+    if (countFactsFenceMarkers(body) > 1) {
       result.warnings.push(
         `${slug}: DOUBLE_FACTS_FENCE: the page body has more than one ## Facts fence. ` +
         `Merge them into one fence and re-save — the existing indexed facts are preserved until then.`,
