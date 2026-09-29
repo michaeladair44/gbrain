@@ -1273,6 +1273,66 @@ export async function buildChecks(
     // Audit read failure is best-effort; skip silently.
   }
 
+  // 3b-tris-bis. Content guards (page-wipe incident 2026-09-24). The fence
+  // writer's pre-rename preservation guard and the sync-side shrink guard log
+  // refusals, and the fence writer logs every successful stub-create /
+  // materialize-from-DB (the stub-guard log above only sees refusals, so it
+  // could never show a destructive write). Any refusal in 24h is a WARN.
+  try {
+    const { readRecentContentGuardEvents } = await import('../core/facts/content-guard-audit.ts');
+    const events = readRecentContentGuardEvents({ sinceMs: 24 * 60 * 60 * 1000 });
+    if (events.length > 0) {
+      const count = (k: string) => events.filter((e) => e.kind === k).length;
+      const blocked = events.filter((e) => e.kind === 'preservation_blocked' || e.kind === 'shrink_blocked');
+      const split =
+        `preservation_blocked=${count('preservation_blocked')}, shrink_blocked=${count('shrink_blocked')}, ` +
+        `materialized_from_db=${count('materialized_from_db')}, stub_created=${count('stub_created')}`;
+      if (blocked.length > 0) {
+        const slugs = [...new Set(blocked.map((e) => e.slug))].slice(0, 5).join(', ');
+        checks.push({
+          name: 'content_guard_24h',
+          status: 'warn',
+          message:
+            `Content guard refused ${blocked.length} write(s) in last 24h that would have wiped page prose (${split}; slugs: ${slugs}). ` +
+            `Check ~/.gbrain/audit/content-guard-*.jsonl and the file vs DB body for each slug; ` +
+            `if a shorter file is intended, re-run the sync with GBRAIN_ALLOW_SHRINK=1.`,
+        });
+      } else {
+        checks.push({ name: 'content_guard_24h', status: 'ok', message: `Content guard activity in last 24h: ${split}.` });
+      }
+    }
+  } catch {
+    // best-effort.
+  }
+
+  // 3b-tris-ter. DB-only pages per source: rows with no markdown file on
+  // disk. This is the exposure surface of the page-wipe bug class (a fact
+  // write to one of these used to stub over it). Informational: the fence
+  // writer now materializes them from the DB. Skipped in --fast (one stat
+  // per page).
+  if (engine && !fastMode) {
+    try {
+      const { countDbOnlyPages } = await import('../core/facts/db-only-pages.ts');
+      const counts = await countDbOnlyPages(engine);
+      const withDbOnly = counts.filter((c) => c.db_only_pages > 0);
+      if (counts.length > 0) {
+        const total = counts.reduce((n, c) => n + c.db_only_pages, 0);
+        checks.push({
+          name: 'db_only_pages',
+          status: 'ok',
+          message: total === 0
+            ? `No DB-only pages (every page in a local source has a markdown file).`
+            : `${total} DB-only page(s) with no markdown file: ` +
+              withDbOnly.map((c) => `${c.source_id}=${c.db_only_pages}/${c.total_pages} (e.g. ${c.sample.slice(0, 3).join(', ')})`).join('; ') +
+              `. Fact writes materialize these from the DB before appending.`,
+          details: { by_source: counts },
+        });
+      }
+    } catch {
+      // best-effort.
+    }
+  }
+
   // 3c. Sync failure trail (Bug 9). sync.ts gates the `sync.last_commit`
   // bookmark when per-file parse errors happen, and appends each failure
   // to ~/.gbrain/sync-failures.jsonl with the commit hash + exact error.
