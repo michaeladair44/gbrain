@@ -522,4 +522,23 @@ describe('Codex wipe-patch r2 regressions', () => {
     expect((await engine.getPage(slug, { sourceId: 'default' }))!.compiled_truth).toBe(pageBefore!.compiled_truth);
     expect(eventsFor(slug).some((e) => e.kind === 'preservation_blocked' && /UNPARSED_LINE/.test(e.detail ?? ''))).toBe(true);
   });
+
+  test('r3 P1: a pipe-less fence row survives sync → reconcile; both original fact ids are kept', async () => {
+    const slug = 'people/no-pipe-sync';
+    await writeFactsToFence(engine, target(slug), [fact('Keep one'), fact('Keep two')]);
+    const filePath = join(brainDir, `${slug}.md`);
+    await importFromFile(engine, filePath, `${slug}.md`, { noEmbed: true, sourceId: 'default' });
+    const ids = await factRows(slug);
+    expect(ids).toHaveLength(2);
+
+    const bad = readFileSync(filePath, 'utf-8').replace(/\n\| 2 \|/, '\n2 |');
+    writeFileSync(filePath, bad, 'utf-8');
+    const imp = await importFromFile(engine, filePath, `${slug}.md`, { noEmbed: true, sourceId: 'default' });
+    expect(imp.status).toBe('imported');
+
+    const rec = await runExtractFacts(engine, { slugs: [slug] });
+    expect(rec.factsDeleted).toBe(0);
+    expect(rec.warnings.join('\n')).toContain('FACTS_FENCE_UNPARSED_LINE');
+    expect(await factRows(slug)).toEqual(ids);
+  });
 });
