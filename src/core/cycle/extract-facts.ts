@@ -59,7 +59,7 @@ import type { BrainEngine } from '../engine.ts';
 import { resolveSupersededByRow, type SupersedeTarget } from '../facts/supersede-resolve.ts';
 import { writeReceipt } from '../extract/receipt-writer.ts';
 import { upsertExtractRollup } from '../extract/rollup-writer.ts';
-import { parseFactsFence, unparsedFactsFenceLines, FACTS_FENCE_BEGIN } from '../facts-fence.ts';
+import { parseFactsFence, FACTS_FENCE_BEGIN } from '../facts-fence.ts';
 import { countFactsFenceMarkers } from '../facts/content-preservation.ts';
 import {
   extractFactsFromFenceText,
@@ -553,14 +553,10 @@ export async function runExtractFacts(
     const body = page.compiled_truth ?? '';
     const parsed = parseFactsFence(body);
     // Lines inside the fence that are not table rows at all (e.g. a row that
-    // lost its leading `|`) are skipped by the parser WITHOUT a warning, so
-    // the recovered rows would read them as deleted (Codex wipe-patch r3).
-    const unparsedLines = unparsedFactsFenceLines(body).map(l => `FACTS_FENCE_UNPARSED_LINE: "${l}"`);
-    if (parsed.warnings.length > 0 || unparsedLines.length > 0) {
-      result.warnings.push(
-        ...parsed.warnings.map(w => `${slug}: ${w}`),
-        ...unparsedLines.map(w => `${slug}: ${w}`),
-      );
+    // lost its leading `|`) warn as FACTS_FENCE_UNPARSED_LINE, so they land
+    // here too instead of reading as deletions (Codex wipe-patch r3).
+    if (parsed.warnings.length > 0) {
+      result.warnings.push(...parsed.warnings.map(w => `${slug}: ${w}`));
       // The parser deliberately skips malformed rows and returns any rows it
       // could still recover. That partial result is not authoritative: using
       // it for reconciliation would interpret skipped rows as deletions.

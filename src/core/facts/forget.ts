@@ -66,6 +66,9 @@ const FENCE_END = '<!--- gbrain:facts:end -->';
  */
 function strikeFenceRow(body: string, rowNum: number, reason: string, today: string): string | null {
   const parsed = parseFactsFence(body);
+  // Re-rendering a fence that did not parse cleanly would drop the skipped
+  // rows; leave the markdown alone and fall back to the DB-only expire.
+  if (parsed.warnings.length > 0) return null;
   const target = parsed.facts.find(f => f.rowNum === rowNum);
   if (!target) return null;
   const updated: ParsedFact[] = parsed.facts.map(f =>
