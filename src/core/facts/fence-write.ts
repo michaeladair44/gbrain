@@ -48,12 +48,12 @@ import { assertSourceFilesystemActive, hasSourceFilesystemLock, withSourceFilesy
 import { gbrainPath } from '../config.ts';
 import { isWriteThroughDisabled, resolvePageWriteTarget } from '../write-through.ts';
 import { isDurabilityHardened, commitWriteThroughFile } from '../brain-repo-durability.ts';
-import { upsertFactRow, parseFactsFence } from '../facts-fence.ts';
+import { upsertFactRow, parseFactsFence, unparsedFactsFenceLines } from '../facts-fence.ts';
 import { contentHash } from '../utils.ts';
 import { extractFactsFromFenceText } from './extract-from-fence.ts';
 import { logStubGuardEvent } from './stub-guard-audit.ts';
 import { logContentGuardEvent } from './content-guard-audit.ts';
-import { nonFenceContent, isDestructiveShrink, countGenuineFactsFences, sameContentTokens } from './content-preservation.ts';
+import { nonFenceContent, isDestructiveShrink, countFactsFenceMarkers, sameContentTokens } from './content-preservation.ts';
 
 /** Resolved source binding for the entity page. */
 export interface FenceTarget {
@@ -465,7 +465,14 @@ export async function writeFactsToFence(
       // recovered rows, silently dropping any row the parser skipped; the
       // mirror + next reconcile would then delete that fact. A page whose
       // existing fence doesn't parse cleanly is not safe to append to.
-      const originalFenceWarnings = parseFactsFence(body).warnings;
+      //
+      //    Lines the parser skips with NO warning (not a table row at all,
+      //    e.g. a row that lost its leading `|`) are just as lost on
+      //    re-render, so they count too (Codex wipe-patch r2 P1-2).
+      const originalFenceWarnings = [
+        ...parseFactsFence(body).warnings,
+        ...unparsedFactsFenceLines(body).map((line) => `FACTS_FENCE_UNPARSED_LINE: "${line}"`),
+      ];
       if (originalFenceWarnings.length > 0) {
         recordWriteFailure(
           target.slug, target.sourceId,
@@ -559,7 +566,7 @@ export async function writeFactsToFence(
       const dbText = existingRow ? nonFenceContent(existingRow.compiled_truth, existingRow.timeline) : '';
       let blockReason: string | null = null;
       let blockBaseline: { text: string; source: 'file' | 'db' } | null = null;
-      const baselineFences = countGenuineFactsFences(tmpBody);
+      const baselineFences = countFactsFenceMarkers(tmpBody);
       if (baselineFences > 1) {
         // Double-fence trap: upsertFactRow only touched the first fence; the
         // reconcile would treat the other fence's rows as stale.

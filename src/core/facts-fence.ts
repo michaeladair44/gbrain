@@ -159,6 +159,26 @@ function parseForgottenFromContext(context: string | undefined): boolean {
 }
 
 /**
+ * Nonblank lines inside the (first) facts fence that parseFactsFence skips
+ * WITHOUT a warning because they are not table rows at all (e.g. a hand-edit
+ * that lost a row's leading `|`). upsertFactRow re-renders the fence from the
+ * parsed rows only, so such a line would vanish on the next append with no
+ * warning to stop it (Codex wipe-patch r2 P1-2). Same fence selection as
+ * parseFactsFence.
+ */
+export function unparsedFactsFenceLines(body: string): string[] {
+  const beginIdx = body.indexOf(FACTS_FENCE_BEGIN);
+  if (beginIdx === -1) return [];
+  const endIdx = body.indexOf(FACTS_FENCE_END, beginIdx + FACTS_FENCE_BEGIN.length);
+  if (endIdx === -1) return [];
+  return body
+    .slice(beginIdx + FACTS_FENCE_BEGIN.length, endIdx)
+    .split('\n')
+    .filter((line) => line.trim() !== '' && !parseRowCells(line))
+    .map((line) => line.trim());
+}
+
+/**
  * Slice the body between the fence markers and parse the table.
  * Returns empty facts + empty warnings when no fence is present.
  *
