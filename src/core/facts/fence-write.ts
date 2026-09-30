@@ -44,6 +44,7 @@ import { inferTypeFromPack, parseMarkdown, serializePageToMarkdown } from '../ma
 import { sanitizeText } from '../batch-rows.ts';
 import { loadActivePackBestEffort } from '../schema-pack/best-effort.ts';
 import { withPageLock } from '../page-lock.ts';
+import { slugifyPath } from '../sync.ts';
 import { assertSourceFilesystemActive, hasSourceFilesystemLock, withSourceFilesystemLock } from '../minions/source-filesystem.ts';
 import { gbrainPath } from '../config.ts';
 import { isWriteThroughDisabled, resolvePageWriteTarget } from '../write-through.ts';
@@ -358,7 +359,16 @@ export async function writeFactsToFence(
         // is a verified live page, so neither stub-guard arm applies.
         // Tags are source-scoped and not on the Page row (C7).
         const tags = await engine.getTags(target.slug, { sourceId: target.sourceId });
-        body = serializePageToMarkdown(existingRow, tags);
+        // #3772 identity rule (same as runExport): a slug that is not a
+        // slugifyPath fixed point (accents, apostrophes, case) would be
+        // re-keyed by the next import of this file, orphaning the DB row —
+        // stamp the stored slug into the frontmatter so import keeps it.
+        const fmSlug = (existingRow.frontmatter as Record<string, unknown> | null | undefined)?.['slug'];
+        const needsSlugStamp = slugifyPath(`${target.slug}.md`) !== target.slug;
+        const rowForDisk = (needsSlugStamp || fmSlug !== undefined) && fmSlug !== target.slug
+          ? { ...existingRow, frontmatter: { ...(existingRow.frontmatter ?? {}), slug: target.slug } }
+          : existingRow;
+        body = serializePageToMarkdown(rowForDisk, tags);
         // Baseline = the materialized file as the parser reads it, so the
         // step-4b check compares like with like (the parser may move a bare
         // `## Timeline` section from the body into the timeline column).

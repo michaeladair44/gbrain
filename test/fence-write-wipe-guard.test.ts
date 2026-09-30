@@ -185,6 +185,27 @@ describe('T1 — DB-only page is materialized from the DB, not stubbed', () => {
     const after = (await countDbOnlyPages(engine)).find((c) => c.source_id === 'default')!;
     expect(after.db_only_pages).toBe(0);
   });
+  test('non-normalized DB-only slug keeps its identity through materialize → import', async () => {
+    // Codex wipe-merge r2: without a frontmatter slug stamp, import re-derives
+    // `people/rene-o-brien` from the filename and orphans the original row.
+    const slug = "people/rené-o'brien";
+    await seedDbOnlyPage(slug);
+    const r = await writeFactsToFence(engine, target(slug), [fact('René joined Initech in 2021')]);
+    expect(r.inserted).toBe(1);
+    expect(r.fenceWriteFailed).toBeUndefined();
+    const filePath = join(brainDir, `${slug}.md`);
+    const file = readFileSync(filePath, 'utf-8');
+    expect(parseMarkdown(file, `${slug}.md`).slug).toBe(slug);
+
+    const imp = await importFromFile(engine, filePath, `${slug}.md`, { noEmbed: true, sourceId: 'default' });
+    expect(imp.status).not.toBe('error');
+    expect(imp.slug).toBe(slug);
+    const after = await engine.getPage(slug, { sourceId: 'default' });
+    expect(after!.compiled_truth).toContain('Previously led infra at Globex');
+    expect(after!.compiled_truth).toContain('René joined Initech in 2021');
+    const twins = await q(`SELECT slug FROM pages WHERE slug ILIKE 'people/ren%' AND deleted_at IS NULL`, []);
+    expect(twins.rows.map((x: { slug: string }) => x.slug)).toEqual([slug]);
+  });
 });
 
 describe('T2 — slug with no DB row still stub-creates', () => {
