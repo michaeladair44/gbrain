@@ -816,3 +816,47 @@ describe('tryRedirectPhantom — fence placement above the timeline sentinel (#4
     });
   });
 });
+
+// ─── Codex wipe-patch r4: a malformed fence row is never dropped ────
+describe('tryRedirectPhantom — malformed fence rows fail closed (wipe-patch r4)', () => {
+  test('phantom fence with a pipe-less row → drift; phantom .md, DB row and fence untouched', async () => {
+    await withTempDirs(async ({ brainDir }) => {
+      await putPage('people/alice-example', '# alice-example\n', { type: 'person' });
+      const phantomBody = FACT_FENCE(
+        `| 1 | Founded Acme | fact | 1.0 | world | high | 2017-01-01 |  | linkedin |  |\n` +
+        `2 | Lost its pipe | fact | 1.0 | world | high | 2018-01-01 |  | linkedin |  |`,
+      );
+      await putPage('alice', phantomBody);
+      writeMd(brainDir, 'people/alice-example', '# alice-example\n');
+
+      const phantom = await engine.getPage('alice', { sourceId: 'default' });
+      const result = await tryRedirectPhantom(engine, phantom!, 'default', brainDir, false);
+      expect(result.outcome).toBe('drift');
+      expect(readMd(brainDir, 'people/alice-example')).toBe('# alice-example\n');
+      const refetched = await engine.getPage('alice', { sourceId: 'default' });
+      expect(refetched?.compiled_truth).toContain('2 | Lost its pipe');
+    });
+  });
+
+  test('canonical fence with a pipe-less row → refuses to rewrite it; canonical .md unchanged, phantom alive', async () => {
+    await withTempDirs(async ({ brainDir }) => {
+      const canonicalMd = FACT_FENCE(
+        `| 1 | Canonical row | fact | 1.0 | world | high | 2016-01-01 |  | linkedin |  |\n` +
+        `2 | Canonical lost its pipe | fact | 1.0 | world | high | 2016-02-01 |  | linkedin |  |`,
+      ).replace('# alice', '# alice-example');
+      await putPage('people/alice-example', '# alice-example\n', { type: 'person' });
+      writeMd(brainDir, 'people/alice-example', canonicalMd);
+      const phantomBody = FACT_FENCE(
+        `| 1 | Founded Acme | fact | 1.0 | world | high | 2017-01-01 |  | linkedin |  |`,
+      );
+      await putPage('alice', phantomBody);
+      writeMd(brainDir, 'alice', phantomBody);
+
+      const phantom = await engine.getPage('alice', { sourceId: 'default' });
+      await expect(tryRedirectPhantom(engine, phantom!, 'default', brainDir, false)).rejects.toThrow(/malformed/);
+      expect(readMd(brainDir, 'people/alice-example')).toBe(canonicalMd);
+      expect(mdExists(brainDir, 'alice')).toBe(true);
+      expect(await engine.getPage('alice', { sourceId: 'default' })).not.toBeNull();
+    });
+  });
+});

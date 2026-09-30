@@ -55,8 +55,9 @@ import { decorateEmbeddingDimError } from './embedding-dim-check.ts';
 import { computeCorpusGeneration, loadSourceRow } from './contextual-retrieval-service.ts';
 import { DEFAULT_SYNOPSIS_MODEL } from './page-summary.ts';
 import { runGuardrails } from './guardrails.ts';
-import { parseFactsFence, renderFactsTable, restoreHiddenFactRows, factsGapWarning, replaceOrInsertFactsFence } from './facts-fence.ts';
+import { parseFactsFence, renderFactsTable, restoreHiddenFactRows, factsGapWarning, replaceOrInsertFactsFence, FACTS_FENCE_BEGIN, FACTS_FENCE_END } from './facts-fence.ts';
 import { scanFencedBlocks, MAX_FENCES_PER_PAGE } from './fence-scan.ts';
+import { nonFenceContent, isDestructiveShrink, countFactsFenceMarkers } from './facts/content-preservation.ts';
 
 /**
  * v0.20.0 Cathedral II Layer 8 D2 — markdown fence extraction helper.
@@ -154,9 +155,31 @@ function mergeHiddenFactRowsIntoBody(
     // sentinel here, so this is dedup, not a behaviour change for the importer).
     return replaceOrInsertFactsFence(incomingBody, renderFactsTable(merge.merged));
   }
+  // The existing fence did not parse cleanly, so remote readers never saw it
+  // (the fence is omitted on read) and cannot have edited it. Keep it
+  // verbatim instead of letting the incoming write drop its rows.
+  if (existingFacts.warnings.length > 0) {
+    const existingFence = rawFactsFenceBlock(existingBody);
+    if (existingFence !== null && rawFactsFenceBlock(incomingBody) !== existingFence) {
+      console.warn(
+        `[gbrain] facts fence on ${slug} is malformed (${existingFacts.warnings.join('; ')}); ` +
+        `kept it unchanged and ignored the incoming fence. Repair the fence in the markdown file.`,
+      );
+      return replaceOrInsertFactsFence(incomingBody, existingFence);
+    }
+  }
   const gapWarning = factsGapWarning(slug, incomingFacts, existingFacts, false);
   if (gapWarning) console.warn(gapWarning);
   return incomingBody;
+}
+
+/** The first facts fence block (markers included) as raw text, or null. */
+function rawFactsFenceBlock(body: string): string | null {
+  const begin = body.indexOf(FACTS_FENCE_BEGIN);
+  if (begin === -1) return null;
+  const end = body.indexOf(FACTS_FENCE_END, begin + FACTS_FENCE_BEGIN.length);
+  if (end === -1) return null;
+  return body.slice(begin, end + FACTS_FENCE_END.length);
 }
 
 /**
@@ -404,6 +427,16 @@ export async function importFromContent(
      * and reindex leave it unset so the guard stays armed.
      */
     allowEmptyOverwrite?: boolean;
+    /**
+     * Sync-side shrink guard (page-wipe incident 2026-09-24). When `true`,
+     * refuse (status 'skipped' + error, so sync feeds the failure ledger and
+     * does not checkpoint the path) an import that would shrink an existing
+     * page's non-fence body + timeline by more than half. Only
+     * `importFromFile` sets it — a stub file sitting over a rich DB row must
+     * not silently overwrite the row. Bypass: the sync allow-shrink flag
+     * or GBRAIN_ALLOW_SHRINK=1.
+     */
+    refuseDestructiveShrink?: boolean;
     beforeCommit?: (tx: BrainEngine, slug: string) => Promise<void>;
     onPostCommitEmbedding?: (complete: () => Promise<ImportEmbeddingResult>) => void;
   } = {},
@@ -810,6 +843,58 @@ export async function importFromContent(
     if (existing.content_hash === legacyHash) {
       await persistUnchanged(true);
       return { slug, status: 'skipped', chunks: 0, parsedPage, ...(typeWarning ? { type_warning: typeWarning } : {}) };
+    }
+  }
+
+  if (opts.refuseDestructiveShrink) {
+    // Double-fence trap (Codex wipe-patch r1 P1-2): parseFactsFence reads
+    // only the FIRST fence, so the extract_facts reconcile would treat the
+    // second fence's rows as stale and delete + reinsert them (new ids, lost
+    // source_session). Refuse the file instead of importing it.
+    const fenceCount = countFactsFenceMarkers(parsed.compiled_truth) + countFactsFenceMarkers(parsed.timeline || '');
+    if (fenceCount > 1) {
+      const { logContentGuardEvent } = await import('./facts/content-guard-audit.ts');
+      logContentGuardEvent({
+        kind: 'double_fence_blocked',
+        slug,
+        source_id: sourceId ?? 'default',
+        detail: `double_facts_fence (${fenceCount} fences)${opts.sourcePath ? ` file=${opts.sourcePath}` : ''}`,
+      });
+      return {
+        slug,
+        status: 'skipped',
+        chunks: 0,
+        error: `DOUBLE_FACTS_FENCE: page '${slug}' has ${fenceCount} facts fences; exactly one is allowed. Merge them into one fence and re-sync.`,
+      };
+    }
+  }
+  if (opts.refuseDestructiveShrink && existing) {
+    const before = nonFenceContent(existing.compiled_truth, existing.timeline);
+    const after = nonFenceContent(parsed.compiled_truth, parsed.timeline);
+    // A file whose parsed body AND timeline are literally empty is a
+    // deliberate clear (the allowEmptyOverwrite contract above). A file that
+    // still carries a fence but lost all prose is NOT (Codex wipe-patch r1
+    // P1-1) — that is the wipe shape, so it goes through the guard.
+    const deliberateClear = `${parsed.compiled_truth}${parsed.timeline ?? ''}`.trim() === '';
+    if (!deliberateClear && isDestructiveShrink(before, after)) {
+      const { logContentGuardEvent } = await import('./facts/content-guard-audit.ts');
+      logContentGuardEvent({
+        kind: 'shrink_blocked',
+        slug,
+        source_id: sourceId ?? 'default',
+        baseline: 'db',
+        before_chars: before.length,
+        after_chars: after.length,
+        detail: opts.sourcePath ? `file=${opts.sourcePath}` : undefined,
+      });
+      return {
+        slug,
+        status: 'skipped',
+        chunks: 0,
+        error:
+          `SHRINK_GUARD: refusing to shrink page '${slug}' non-fence content from ${before.length} to ${after.length} chars ` +
+          `(>50% loss). If the file is correct, re-run the sync with GBRAIN_ALLOW_SHRINK=1 (see gbrain sync --help, allow-shrink).`,
+      };
     }
   }
 
@@ -1316,6 +1401,8 @@ export async function importFromFile(
      * never per file (codex perf finding #7).
      */
     activePack?: { page_types: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string>; aliases?: ReadonlyArray<string> }> };
+    /** Bypass the shrink guard (see importFromContent `refuseDestructiveShrink`). */
+    allowShrink?: boolean;
   } = {},
 ): Promise<ImportResult> {
   // Defense-in-depth: reject symlinks before reading content.
@@ -1483,6 +1570,9 @@ export async function importFromFile(
     // The disk file IS the source of truth: a file the user emptied is a
     // deliberate clear, so it passes putPage's empty-overwrite guard.
     allowEmptyOverwrite: true,
+    // ...but a file that silently lost most of a rich page's prose (a
+    // stub written over a DB-only page) must not be mirrored into the DB.
+    refuseDestructiveShrink: !(opts.allowShrink || process.env.GBRAIN_ALLOW_SHRINK === '1'),
   });
 }
 

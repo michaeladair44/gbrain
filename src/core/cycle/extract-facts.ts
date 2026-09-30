@@ -60,6 +60,7 @@ import { resolveSupersededByRow, type SupersedeTarget } from '../facts/supersede
 import { writeReceipt } from '../extract/receipt-writer.ts';
 import { upsertExtractRollup } from '../extract/rollup-writer.ts';
 import { parseFactsFence, FACTS_FENCE_BEGIN } from '../facts-fence.ts';
+import { countFactsFenceMarkers } from '../facts/content-preservation.ts';
 import {
   extractFactsFromFenceText,
   FENCE_SOURCE_DEFAULT,
@@ -551,10 +552,11 @@ export async function runExtractFacts(
 
     const body = page.compiled_truth ?? '';
     const parsed = parseFactsFence(body);
+    // Lines inside the fence that are not table rows at all (e.g. a row that
+    // lost its leading `|`) warn as FACTS_FENCE_UNPARSED_LINE, so they land
+    // here too instead of reading as deletions (Codex wipe-patch r3).
     if (parsed.warnings.length > 0) {
-      result.warnings.push(
-        ...parsed.warnings.map(w => `${slug}: ${w}`),
-      );
+      result.warnings.push(...parsed.warnings.map(w => `${slug}: ${w}`));
       // The parser deliberately skips malformed rows and returns any rows it
       // could still recover. That partial result is not authoritative: using
       // it for reconciliation would interpret skipped rows as deletions.
@@ -582,6 +584,18 @@ export async function runExtractFacts(
     // substring check false-positives on the marker text merely being
     // mentioned in a doc code-block or quoted prose, wrongly blocking a
     // genuine deletion and leaving stale facts indexed indefinitely).
+    // Double-fence trap (page-wipe incident 2026-09-24): parseFactsFence
+    // reads only the FIRST fence, so rows living in a second fence would be
+    // read as deleted and the whole page wiped + reinserted (new ids, lost
+    // source_session, broken supersession). Non-authoritative → preserve.
+    if (countFactsFenceMarkers(body) > 1) {
+      result.warnings.push(
+        `${slug}: DOUBLE_FACTS_FENCE: the page body has more than one ## Facts fence. ` +
+        `Merge them into one fence and re-save — the existing indexed facts are preserved until then.`,
+      );
+      continue;
+    }
+
     if (timelineHasGenuineFactsFenceMarker(page.timeline ?? '')) {
       result.warnings.push(
         `${slug}: FACTS_FENCE_BELOW_SENTINEL: a ## Facts fence was found below ` +
