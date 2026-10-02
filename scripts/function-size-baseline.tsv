@@ -36,14 +36,16 @@ src/core/context/retrieval-reflex.ts	resolveEntitiesToPointers	355	seed: W5 base
 src/core/cycle.ts	runCycle	1229	seed: W5 baseline, refactor wave 1 (decomposition deferred to wave 2, plan D1)
 src/core/cycle/extract-atoms.ts	runPhaseExtractAtoms	810	seed: W5 baseline, refactor wave 1 (decomposition deferred to wave 2, plan D1)
 src/core/cycle/extract-atoms.ts	runPhaseExtractAtoms>withBudgetTracker(#1)	305	seed: W5 baseline, refactor wave 1 (decomposition deferred to wave 2, plan D1)
-src/core/cycle/extract-facts.ts	runExtractFacts	505	seed: W5 baseline, refactor wave 1 (decomposition deferred to wave 2, plan D1)
+src/core/cycle/extract-facts.ts	runExtractFacts	518	seed: W5 baseline, refactor wave 1 (decomposition deferred to wave 2, plan D1); +13 wipe-patch (fork PR michaeladair44/gbrain#1): DOUBLE_FACTS_FENCE + unparsed-line reconcile gates
 src/core/cycle/grade-takes.ts	GradeTakesPhase.process	402	seed: W5 baseline, refactor wave 1 (decomposition deferred to wave 2, plan D1)
 src/core/cycle/patterns.ts	runPhasePatterns	303	seed: W5 baseline, refactor wave 1 (decomposition deferred to wave 2, plan D1)
 src/core/cycle/propose-takes.ts	ProposeTakesPhase.process	427	seed: W5 baseline, refactor wave 1 (decomposition deferred to wave 2, plan D1)
 src/core/cycle/synthesize-concepts.ts	runPhaseSynthesizeConcepts	447	seed: W5 baseline, refactor wave 1 (decomposition deferred to wave 2, plan D1)
 src/core/cycle/synthesize.ts	runPhaseSynthesizeInner	1043	seed: W5 baseline, refactor wave 1 (decomposition deferred to wave 2, plan D1)
 src/core/facts/backstop.ts	runPipelineBodyInner	358	seed: W5 baseline, refactor wave 1 (decomposition deferred to wave 2, plan D1)
-src/core/import-file.ts	importFromContent	857	seed: W5 baseline, refactor wave 1 (decomposition deferred to wave 2, plan D1)
+src/core/facts/fence-write.ts	writeFactsToFence	415	wipe-patch (fork PR michaeladair44/gbrain#1, page-wipe incident 2026-09-24): fence-write materialize + pre-rename preservation guard ported from v0.50.5.0; decompose when the fix goes upstream
+src/core/facts/fence-write.ts	writeFactsToFence>withPageLock(#1)	352	wipe-patch (fork PR michaeladair44/gbrain#1, page-wipe incident 2026-09-24): fence-write materialize + pre-rename preservation guard ported from v0.50.5.0; decompose when the fix goes upstream
+src/core/import-file.ts	importFromContent	919	seed: W5 baseline, refactor wave 1 (decomposition deferred to wave 2, plan D1); +62 wipe-patch (fork PR michaeladair44/gbrain#1): sync SHRINK_GUARD + DOUBLE_FACTS_FENCE refusal
 src/core/minions/handlers/subagent-oneshot.ts	runSubagentOneshot	377	seed: W5 baseline, refactor wave 1 (decomposition deferred to wave 2, plan D1)
 src/core/minions/handlers/subagent.ts	makeSubagentHandler	884	seed: W5 baseline, refactor wave 1 (decomposition deferred to wave 2, plan D1)
 src/core/minions/handlers/subagent.ts	makeSubagentHandler>subagentHandlerInner	814	seed: W5 baseline, refactor wave 1 (decomposition deferred to wave 2, plan D1)
