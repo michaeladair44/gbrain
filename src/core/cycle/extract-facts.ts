@@ -73,6 +73,7 @@ import { writeReceipt } from '../extract/receipt-writer.ts';
 import { fenceUnfencedFacts, planUnfencedFacts } from '../facts/unfenced-facts.ts';
 import { classifyRunStop, upsertExtractRollup } from '../extract/rollup-writer.ts';
 import { parseFactsFence, FACTS_FENCE_BEGIN } from '../facts-fence.ts';
+import { countFactsFenceMarkers } from '../facts/content-preservation.ts';
 import {
   duplicateActiveFenceRows,
   extractFactsFromFenceText,
@@ -352,6 +353,17 @@ async function planFenceReconcile(db: BrainEngine, page: { compiled_truth: strin
     // could still recover. That partial result is not authoritative: using
     // it for reconciliation would interpret skipped rows as deletions.
     warnings.push(...parsed.warnings.map(w => `${slug}: ${w}`));
+    return null;
+  }
+  // Double-fence trap (page-wipe incident 2026-09-24): parseFactsFence
+  // reads only the FIRST fence, so rows living in a second fence would be
+  // read as deleted and the whole page wiped + reinserted (new ids, lost
+  // source_session, broken supersession). Non-authoritative → preserve.
+  if (countFactsFenceMarkers(page.compiled_truth ?? '') > 1) {
+    warnings.push(
+      `${slug}: DOUBLE_FACTS_FENCE: the page body has more than one ## Facts fence. ` +
+      `Merge them into one fence and re-save — the existing indexed facts are preserved until then.`,
+    );
     return null;
   }
   // #3625: a fence below the timeline sentinel lands in page.timeline, where

@@ -250,7 +250,13 @@ export function mergePhantomFenceRows(
   dbMaxRowNum: number,
 ): { body: string | null; renumber: Map<number, number> } {
   const renumber = new Map<number, number>();
-  const { facts: existingFacts } = parseFactsFence(body);
+  const { facts: existingFacts, warnings: existingWarnings } = parseFactsFence(body);
+  // Re-rendering a fence that did not parse cleanly drops the skipped rows.
+  if (existingWarnings.length > 0) {
+    throw new Error(
+      `phantom-redirect: canonical facts fence is malformed; repair it before redirecting: ${existingWarnings.join('; ')}`,
+    );
+  }
 
   // Dedup key combines claim + valid_from. We deliberately do NOT include
   // valid_until or status in the key so that a "fact about Alice" already
@@ -373,13 +379,17 @@ export async function mergePhantomLinks(engine: BrainEngine, phantomId: number, 
  * valid_from), classify as `drift` — operator triages manually.
  *
  * When the disk file is absent, the DB body is the truth; not drift.
+ * A fence that parses with warnings on either side is always drift.
  */
 function fenceDbDrift(page: Page, brainDir: string): boolean {
-  const phantomPath = path.join(brainDir, `${page.slug}.md`);
-  if (!fs.existsSync(phantomPath)) return false;
-
   const dbBody = page.compiled_truth ?? '';
   const dbParse = parseFactsFence(dbBody);
+  // A fence that did not parse cleanly cannot be carried to the canonical
+  // without dropping its skipped rows — classify as drift, operator triages.
+  if (dbParse.warnings.length > 0) return true;
+
+  const phantomPath = path.join(brainDir, `${page.slug}.md`);
+  if (!fs.existsSync(phantomPath)) return false;
   const dbKeys = new Set(dbParse.facts.map((f) => `${f.claim}|${f.validFrom ?? ''}`));
 
   let diskBody: string;
@@ -401,6 +411,7 @@ function fenceDbDrift(page: Page, brainDir: string): boolean {
     return true;
   }
   const diskParse = parseFactsFence(diskCompiled);
+  if (diskParse.warnings.length > 0) return true;
   const diskKeys = new Set(diskParse.facts.map((f) => `${f.claim}|${f.validFrom ?? ''}`));
 
   if (dbKeys.size !== diskKeys.size) return true;

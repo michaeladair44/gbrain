@@ -98,6 +98,11 @@ Options:
   --no-pull            Skip 'git pull' before the sync. Required on managed
                        brains: 'gbrain sources refresh <id>' moves the
                        checkout, and sync catches the index up to it.
+  --allow-shrink       Let a file replace a page even when it drops more
+                       than half of the page's non-fence body + timeline
+                       (the SHRINK_GUARD failure). Same as GBRAIN_ALLOW_SHRINK=1.
+                       Not forwarded to a delegated 'gbrain serve' run;
+                       combine with --no-delegate.
   --no-bulk            Managed Postgres sync: publish one page per transaction
                        instead of bulk groups (each page keeps its own write
                        request either way). Persist with
@@ -223,6 +228,9 @@ export function parseSyncFlags(args: string[]) {
   const noBulk = args.includes('--no-bulk');
   const lanesAt = args.indexOf('--lanes');
   const lanes = args.includes('--no-lanes') ? 1 : lanesAt === -1 ? undefined : intFlagValue(args[lanesAt + 1], '--lanes', { min: 1, max: 16, example: 8 });
+  // Page-wipe incident 2026-09-24: importFromFile's shrink guard reads this
+  // env var, so it reaches every import path this process runs.
+  if (args.includes('--allow-shrink')) process.env.GBRAIN_ALLOW_SHRINK = '1';
   let noEmbed = resolveNoEmbed(args, loadConfig());
   const noExtract = args.includes('--no-extract'); // v0.42.7 #1696
   const skipFailed = args.includes('--skip-failed');
