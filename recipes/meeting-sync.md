@@ -16,6 +16,7 @@ health_checks:
     headers:
       Authorization: "Bearer $CIRCLEBACK_TOKEN"
       Content-Type: "application/json"
+      Accept: "application/json, text/event-stream"
       x-circleback-cli-version: "0.3.5"
     body: '{"jsonrpc":"2.0","method":"tools/list","id":1}'
     label: "Circleback API"
@@ -142,6 +143,7 @@ curl -sf -H "Authorization: Bearer $CIRCLEBACK_TOKEN" \
   -H "x-circleback-cli-version: 0.3.5" \
   "https://app.circleback.ai/api/mcp" \
   -X POST -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
   -d '{"jsonrpc":"2.0","method":"tools/list","id":1}' \
   | grep -q '"result"' \
   && echo "PASS: Circleback API connected" \
@@ -388,6 +390,10 @@ live sync to index the new pages.
 **HTTP 426 "CLI version out of date":**
 - Circleback raised the minimum CLI version it accepts. Set `x-circleback-cli-version` (health check,
   Step 1 curl, sync script) to the current version: `npm view @circleback/cli version`
+
+**HTTP 406 "Not Acceptable":**
+- The endpoint is MCP over streamable HTTP and only answers a request whose `Accept` header lists both
+  `application/json` and `text/event-stream`. Add that header (health check, Step 1 curl, sync script).
 
 **Transcript is empty:**
 - Some meetings may not have transcripts (e.g., no audio, bot was removed)
