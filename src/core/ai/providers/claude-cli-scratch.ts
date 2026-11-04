@@ -15,14 +15,17 @@
  * discovered path is a reliable fingerprint.
  */
 
-import { readdirSync, rmSync } from 'node:fs';
+import { existsSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { claudeProjectsDir } from '../../bootstrap/host-specs.ts';
 
 /** Basename prefix of the per-PID cwd the claude-cli subprocess runs in. */
 export const CLAUDE_CLI_CWD_PREFIX = 'gbrain-claude-cli-cwd-';
 /** Basename prefix of the per-PID hermetic CLAUDE_CONFIG_DIR (#4119). */
 export const CLAUDE_CLI_CONFIG_PREFIX = 'gbrain-claude-cli-config-';
+
+const SESSION_ID_RE = /^[A-Za-z0-9_-][A-Za-z0-9._-]*$/;
 
 /** The per-PID scratch cwd path for this process. */
 export function claudeCliCwdDir(pid: number = process.pid): string {
@@ -41,6 +44,68 @@ export function claudeCliConfigDir(pid: number = process.pid): string {
  */
 export function isClaudeCliSelfTranscriptPath(path: string): boolean {
   return path.includes(CLAUDE_CLI_CWD_PREFIX);
+}
+
+/**
+ * #5413 — session ids of gbrain's own claude-cli subprocess sessions, read
+ * from the harness transcripts Claude Code keeps under
+ * `<projectsRoot>/<slugified scratch cwd>/<session id>.jsonl`. The
+ * session-end hook names each corpus file `<session id>.txt`, so a corpus
+ * file whose stem is in this set is a self-capture from before the hook
+ * refused them. Best-effort: a capture whose harness transcript Claude Code
+ * has since pruned is unclassifiable and stays in the corpus.
+ */
+export function claudeCliSelfSessionIds(projectsRoot: string = claudeProjectsDir()): Set<string> {
+  return new Set(claudeCliSelfSessions(projectsRoot).keys());
+}
+
+/**
+ * #7343: every self session id mapped to the first scratch project holding its
+ * transcript, from one listing per scratch project. Bulk classifiers (doctor
+ * `self_capture`, `captured_facts_active`) look ids up here instead of
+ * checking every scratch project once per item.
+ */
+export function claudeCliSelfSessions(projectsRoot: string = claudeProjectsDir()): Map<string, string> {
+  const sessions = new Map<string, string>();
+  for (const project of claudeCliSelfProjectDirs(projectsRoot)) {
+    let files: string[];
+    try {
+      files = readdirSync(project);
+    } catch {
+      continue;
+    }
+    for (const file of files) {
+      const id = file.slice(0, -'.jsonl'.length);
+      if (file.endsWith('.jsonl') && SESSION_ID_RE.test(id) && !sessions.has(id)) sessions.set(id, project);
+    }
+  }
+  return sessions;
+}
+
+/** The harness project dirs of gbrain claude-cli scratch cwds (one listing of
+ * the projects root; no project's files are read). */
+export function claudeCliSelfProjectDirs(projectsRoot: string = claudeProjectsDir()): string[] {
+  try {
+    return readdirSync(projectsRoot)
+      .filter(isClaudeCliSelfTranscriptPath)
+      .map((project) => join(projectsRoot, project));
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * #5820 — the ONE single-session self-capture classifier (serve-side
+ * writeback harvest, the sweep's corpus pass, doctor `self_capture`): true
+ * when a scratch project holds `<id>.jsonl`. Pass `projectDirs` to classify
+ * many ids against one listing.
+ */
+export function isClaudeCliSelfSessionId(
+  id: string,
+  projectDirs: readonly string[] = claudeCliSelfProjectDirs(),
+): boolean {
+  if (!SESSION_ID_RE.test(id)) return false;
+  return projectDirs.some((dir) => existsSync(join(dir, `${id}.jsonl`)));
 }
 
 function isPidAlive(pid: number): boolean {

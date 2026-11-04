@@ -1,10 +1,96 @@
 /**
- * mcp-registration.ts — shared MCP-registration helpers for HTTP+bearer
- * wiring (extracted from src/commands/connect.ts for #4043 [F5]: the harness
- * lane in src/core/bootstrap/ needs these, and core must not import from
- * commands). connect.ts re-exports everything here, so its public surface
- * and tests are unchanged.
+ * mcp-registration.ts — shared MCP-registration helpers: the one stdio
+ * registration surface and serve argv every stdio registration gbrain writes
+ * builds from (readiness, init's quickstart, `bootstrap hooks` for Claude
+ * Code / Codex / opencode, the plugin generator), plus the HTTP+bearer
+ * wiring helpers (extracted from src/commands/connect.ts for #4043 [F5]: the
+ * harness lane in src/core/bootstrap/ needs these, and core must not import
+ * from commands). connect.ts re-exports everything here, so its public
+ * surface and tests are unchanged.
  */
+
+import { shellQuote } from './shell-quote.ts';
+import type { McpSurface } from '../mcp/surface.ts';
+
+export { shellQuote };
+
+/**
+ * The surface a new stdio registration pins: `starter`, the daily-driver tool
+ * list (Garry, 2026-10-24: new installs register starter instead of full;
+ * gbrain-evals#191 measured unchanged reach and accuracy with 17-23% fewer
+ * input tokens). Every install path reads this one value: README, docs/mcp,
+ * the plugin manifests and every registration gbrain writes. An existing
+ * registration keeps its surface; `--surface full` is the opt-in for every
+ * operation, and any hidden parameter or tool stays reachable through
+ * `request_tools`.
+ */
+export const REGISTRATION_SURFACE: McpSurface = 'starter';
+
+/**
+ * The surface the Codex and Claude Code plugin manifests pin: `full`. A plugin
+ * update rewrites the registration of every existing plugin install, so
+ * narrowing it would change existing installs without asking; plugins keep
+ * full (as does a bare `serve`, whose default is unchanged).
+ */
+export const PLUGIN_SURFACE: McpSurface = 'full';
+
+/**
+ * What a new registration's tools/list shows: the seven memory verbs plus
+ * request_tools (`serve --advertise verbs`). Everything REGISTRATION_SURFACE
+ * allows stays callable, and request_tools returns any tool's full schema.
+ * Approved 2026-10-25 on harness-evals#70: no pass-rate cost, no
+ * cross-scope reads, recall about 3x faster than search. Applies only when
+ * the user chose no surface: an explicit `--surface` or GBRAIN_SURFACE lists
+ * that surface in full, and an existing registration keeps its own form.
+ */
+export const REGISTRATION_ADVERTISE: McpSurface = 'verbs';
+
+/** A registration command's surface value (`verbs`, `starter` or `full`). */
+export function isRegistrationSurface(v: unknown): v is McpSurface {
+  return v === 'verbs' || v === 'starter' || v === 'full';
+}
+
+const SURFACE_ORDER: readonly McpSurface[] = ['verbs', 'starter', 'full'];
+
+/**
+ * `<bin> serve --surface <surface> [--advertise <advertise>]`. `null` renders
+ * a bare `<bin> serve` (config/default resolution): never-narrow keeps an
+ * existing bare registration bare when it replaces it. `--advertise` is
+ * written only when it is narrower than the surface.
+ */
+export function stdioServeArgv(bin: string, surface: McpSurface | null = REGISTRATION_SURFACE, advertise: McpSurface | null = null): string[] {
+  if (!surface) return [bin, 'serve'];
+  return [bin, 'serve', '--surface', surface, ...(advertise && SURFACE_ORDER.indexOf(advertise) < SURFACE_ORDER.indexOf(surface) ? ['--advertise', advertise] : [])];
+}
+
+/**
+ * The listing a registration writes. A surface the user chose (flag or
+ * GBRAIN_SURFACE) is listed in full; an existing registration keeps its own
+ * `--advertise` (none on registrations written before this default); a new
+ * registration lists REGISTRATION_ADVERTISE.
+ */
+export function registrationAdvertise(opts: { userChoseSurface: boolean; prior?: { advertise?: McpSurface | null } | null }): McpSurface | null {
+  if (opts.userChoseSurface) return null;
+  if (opts.prior) return opts.prior.advertise ?? null;
+  return REGISTRATION_ADVERTISE;
+}
+
+/** An existing registration's `--advertise` value, `null` when it lists everything it serves. */
+export function registeredAdvertise(text: string): McpSurface | null {
+  const m = /--advertise[\s=]+["']?(verbs|starter|full)\b/.exec(text);
+  return m ? m[1] as McpSurface : null;
+}
+
+/**
+ * The surface form of an existing registration's command text (`mcp get`
+ * output, an opencode `command` array joined): the pinned value, `null` for
+ * a bare `serve`, `undefined` when no serve command is visible.
+ */
+export function registeredSurface(text: string): McpSurface | null | undefined {
+  const pinned = /--surface[\s=]+["']?(verbs|starter|full)\b/.exec(text);
+  if (pinned) return pinned[1] as McpSurface;
+  return /\bserve\b/.test(text) ? null : undefined;
+}
 
 export const REDACTED = '***';
 export const NAME_RE = /^[a-z0-9][a-z0-9_-]*$/;
@@ -149,16 +235,6 @@ export function buildCodexMcpAddArgv(p: { name: string; url: string; envVar: str
  */
 export function buildOpencodeMcpAddArgv(p: { name: string; url: string; envVar: string }): string[] {
   return ['mcp', 'add', p.name, '--url', p.url, '--header', `Authorization=Bearer {env:${p.envVar}}`];
-}
-
-/**
- * POSIX single-quote any arg that isn't already shell-safe, so `$()`, backticks,
- * etc. in a token are inert literals when the block is pasted into a shell
- * (double-quoting would still allow command substitution).
- */
-export function shellQuote(arg: string): string {
-  if (/^[A-Za-z0-9_.:/@-]+$/.test(arg)) return arg;
-  return `'${arg.replace(/'/g, "'\\''")}'`;
 }
 
 /** Render `<binary> <argv...>` as a copy-pasteable, shell-safe command string. */

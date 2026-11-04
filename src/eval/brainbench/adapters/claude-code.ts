@@ -45,7 +45,7 @@ import {
   resolveSocketPath,
   startResolveIpcServer,
 } from '../../../core/context/resolve-ipc.ts';
-import { assembleTurnContext } from '../../../core/context/turn-context.ts';
+import { assembleTurnContext, type TurnContextResult } from '../../../core/context/turn-context.ts';
 import { resolveEntitiesToPointers } from '../../../core/context/retrieval-reflex.ts';
 import type {
   AdapterFixtureView,
@@ -103,6 +103,8 @@ export class ClaudeCodeAdapter implements HarnessAdapter {
   // ── per-conversation state ──
   private turns: PublicTurn[] = [];
   private injectionByTurnId = new Map<number, string>();
+  /** System One S6 meta from the turn_context handler this turn (present only when recall_needed is not off). */
+  private turnDecide: TurnContextResult['decide'];
 
   async setupRun(): Promise<void> {
     this.tmpHome = mkdtempSync(join(tmpdir(), 'brainbench-cc-'));
@@ -141,7 +143,7 @@ export class ClaudeCodeAdapter implements HarnessAdapter {
                 priorContextText: req.priorContextText,
                 sessionId: req.sessionId,
                 maxBytes: req.maxBytes,
-              })
+              }).then((r) => { this.turnDecide = r.decide; return r; })
             : Promise.resolve(null),
       },
       { secret: this.secret },
@@ -205,6 +207,7 @@ export class ClaudeCodeAdapter implements HarnessAdapter {
       throw new Error('claude-code adapter: beginConversation not called');
     }
     const started = performance.now();
+    this.turnDecide = undefined;
 
     const transcriptPath = this.writeTranscript(turn.turn_id);
     const wireIn: UserPromptSubmitHookInput = {
@@ -226,6 +229,7 @@ export class ClaudeCodeAdapter implements HarnessAdapter {
       userPromptDeadlineMs: BENCH_USER_PROMPT_DEADLINE_MS,
       configOverride: cfg,
       disablePushBanner: true,
+      turnRule: null,
       // Telemetry paths resolve from GBRAIN_HOME/homedir, not configOverride
       // — without this, every fixture turn appends to the OPERATOR's real
       // hook heartbeat history (codex ship-review).
@@ -263,6 +267,7 @@ export class ClaudeCodeAdapter implements HarnessAdapter {
       pointers: [],
       injectedTokens: estimateTokens(injected),
       latencyMs,
+      ...(this.turnDecide ? { decide: this.turnDecide } : {}),
     };
   }
 

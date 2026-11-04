@@ -199,6 +199,7 @@ const SESSION_MARKERS = new Set(['chat', 'session', 'sessions']);
 
 export function sessionPrefix(slug: string): string | null {
   if (!slug.includes('/')) return null;
+  if (slug.startsWith('atoms/')) return null;
   const segments = slug.split('/');
   // Strategy: walk segments left-to-right. Find the first segment that's
   // either a session marker (chat/session/sessions) OR a date prefix.
@@ -261,6 +262,17 @@ export function computeScoreDistribution(scores: number[]): ScoreDistribution {
     max: asc[asc.length - 1],
     reorder_band_width: asc[asc.length - 1] - asc[0],
   };
+}
+
+/**
+ * The deduped page ids of the first `topK` results, the input of the
+ * adjacency read. Array order, not score, picks them, so runPostFusionStages
+ * can start the read before the earlier stages mutate scores.
+ */
+export function graphSignalPageIds(results: SearchResult[], topK: number = DEFAULT_TOP_K): number[] {
+  return Array.from(
+    new Set(results.slice(0, topK).map(r => r.page_id).filter(id => typeof id === 'number' && id > 0)),
+  );
 }
 
 // ===========================================================================
@@ -326,9 +338,7 @@ export async function applyGraphSignals(
   // (page_id is documented as REQUIRED in SearchResult JSDoc) — skip
   // such rows from the dedup set; they can't be matched in the result
   // Map anyway.
-  const uniquePageIds = Array.from(
-    new Set(topK.map(r => r.page_id).filter(id => typeof id === 'number' && id > 0)),
-  );
+  const uniquePageIds = graphSignalPageIds(results, topKSize);
 
   let adjacency: Map<number, AdjacencyRow>;
   try {

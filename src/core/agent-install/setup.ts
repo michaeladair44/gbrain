@@ -8,11 +8,17 @@ import { acquireBootstrapLock } from '../bootstrap/lock.ts';
 import { harnessAdapter } from '../harness/registry.ts';
 import { renderAgentLauncher } from './launcher.ts';
 import { shellQuote } from '../mcp-registration.ts';
+import { SHARED_CONTENT_MIGRATION_VERSION } from '../../commands/migrations/shared-content.ts';
+import { installLocalSharedSkills, type LocalSharedSkillsResult } from './shared-skills.ts';
 import {
   AgentInstallError, checkedRoot, confinedPath, installReceiptPath, isolatedAgentEnv, privateWrite,
   readFileConfigState, readInstallReceipt, sha256, writeInstallReceipt,
   type AgentHarness, type AgentInstallReceipt, type InstallArtifact,
 } from './state.ts';
+import { bunSpawn, bunSpawnSync } from '../spawn.ts';
+import { MINIMUM_BUN_VERSION, bunVersionMeets } from '../runtime-version.ts';
+
+const SETUP_HELPER_URL = 'https://raw.githubusercontent.com/garrytan/gbrain/latest-stable/scripts/setup-in-agent.sh';
 
 export interface AgentSetupOptions {
   root: string;
@@ -22,6 +28,9 @@ export interface AgentSetupOptions {
   sourceRef: string;
   adopt?: boolean;
   upgrade?: boolean;
+  skills?: 'follow' | 'memory-only';
+  /** The caller reads JSON output; a refusal's rerun command keeps `--json`. */
+  json?: boolean;
 }
 export interface AgentSetupResult {
   status: 'installed' | 'repaired' | 'unchanged';
@@ -33,11 +42,12 @@ export interface AgentSetupResult {
   maintenance: string;
   native_verification: 'unverified';
   search_mode_confirmation_required: boolean;
+  shared_skills: LocalSharedSkillsResult;
 }
 
 async function cli(root: string, artifact: InstallArtifact, args: string[]): Promise<void> {
-  const commandArgs = args.includes('--migrate-only') ? [...args, '--json'] : args;
-  const child = Bun.spawn([join(root, artifact.directory, 'bun'), '--no-env-file', join(root, artifact.cli), '--brain', 'host', ...commandArgs], {
+  const commandArgs = args.includes('--migrate-only') || args[0] === 'apply-migrations' ? [...args, '--json'] : args;
+  const child = bunSpawn([join(root, artifact.directory, 'bun'), '--no-env-file', join(root, artifact.cli), '--brain', 'host', ...commandArgs], {
     cwd: root, env: { ...isolatedAgentEnv(root), DATABASE_URL: '', GBRAIN_DATABASE_URL: '', ...(args[0] === 'init' ? { GBRAIN_IN_AGENT_SETUP: '1' } : {}) },
     stdin: 'ignore', stdout: 'pipe', stderr: 'pipe',
   });
@@ -50,7 +60,7 @@ async function cli(root: string, artifact: InstallArtifact, args: string[]): Pro
     if (errors) process.stderr.write(errors);
     if (code !== 0) {
       let failure: { error?: string; reason?: string; next_action?: string } | undefined;
-      try { failure = JSON.parse(output); } catch { /* ordinary command error remains below */ }
+      try { failure = JSON.parse(output.trim().split(/\r?\n/).at(-1) ?? ''); } catch { /* ordinary command error remains below */ }
       if (failure?.error === 'pglite_busy') throw new PgliteBusyError(
         failure.next_action ?? 'The database is busy. Wait for its owner to finish and rerun setup; do not remove its lock.',
         failure.reason === 'live_serve' ? 'live_serve' : 'timeout',
@@ -76,7 +86,7 @@ function artifactFromBundle(bundle: string, sourceRef: string): Omit<InstallArti
     throw new AgentInstallError('invalid_artifact', 'Setup bundle does not contain the GBrain package and setup helper.');
   }
   if (!/^[a-f0-9]{40}$/.test(sourceRef)) throw new AgentInstallError('invalid_artifact_ref', 'A resolved 40-character source commit is required.');
-  const version = Bun.spawnSync([bun, '--version'], { stdout: 'pipe', stderr: 'pipe' });
+  const version = bunSpawnSync([bun, '--version'], { stdout: 'pipe', stderr: 'pipe' });
   if (version.exitCode !== 0) throw new AgentInstallError('runtime_unusable', 'The staged Bun runtime is not executable on this machine.');
   return { source_ref: sourceRef, version: pkg.version, bun_version: version.stdout.toString().trim(), bun_sha256: sha256(readFileSync(bun)), package_sha256: sha256(readFileSync(join(packageDir, 'package.json'))) };
 }
@@ -105,7 +115,7 @@ function installArtifact(root: string, options: AgentSetupOptions, identity: Ret
 function artifactUsable(root: string, artifact: InstallArtifact): boolean {
   try {
     if (!existsSync(confinedPath(root, artifact.cli)) || sha256(readFileSync(confinedPath(root, `${artifact.directory}/bun`))) !== artifact.bun_sha256) return false;
-    const probe = Bun.spawnSync([join(root, artifact.directory, 'bun'), '--no-env-file', join(root, artifact.cli), '--version'], {
+    const probe = bunSpawnSync([join(root, artifact.directory, 'bun'), '--no-env-file', join(root, artifact.cli), '--version'], {
       cwd: root, env: { ...isolatedAgentEnv(root), DATABASE_URL: '', GBRAIN_DATABASE_URL: '' }, stdout: 'pipe', stderr: 'pipe', timeout: 15_000,
     });
     return probe.exitCode === 0;
@@ -116,12 +126,8 @@ function artifactUsable(root: string, artifact: InstallArtifact): boolean {
 function ownFile(receipt: AgentInstallReceipt, path: string, text: string, mode = 0o600): boolean {
   const target = confinedPath(receipt.root, path);
   const desired = sha256(text);
-  const pending = receipt.pending_files?.[path];
-  if (existsSync(target)) {
-    const actual = sha256(readFileSync(target));
-    if (actual !== receipt.owned_files[path] && actual !== pending?.before && actual !== pending?.after) {
-      throw new AgentInstallError('modified_owned_file', `Preserve your changes at ${target} before rerunning setup; it will not be overwritten.`);
-    }
+  const actual = ownedFileHash(receipt, path);
+  if (actual !== null) {
     if (actual === desired) {
       receipt.owned_files[path] = desired;
       if (receipt.pending_files) delete receipt.pending_files[path];
@@ -129,9 +135,8 @@ function ownFile(receipt: AgentInstallReceipt, path: string, text: string, mode 
       return false;
     }
   }
-  // Write-ahead ownership: a killed write can be resumed only for these bytes.
   receipt.pending_files ??= {};
-  receipt.pending_files[path] = { before: existsSync(target) ? sha256(readFileSync(target)) : null, after: desired };
+  receipt.pending_files[path] = { before: actual, after: desired };
   writeInstallReceipt(receipt);
   privateWrite(target, text, mode);
   receipt.owned_files[path] = desired;
@@ -140,7 +145,20 @@ function ownFile(receipt: AgentInstallReceipt, path: string, text: string, mode 
   return true;
 }
 
-export function renderLocalInstructions(root: string, sourceId: string): string {
+function ownedFileHash(receipt: AgentInstallReceipt, path: string): string | null {
+  const target = confinedPath(receipt.root, path);
+  const pending = receipt.pending_files?.[path];
+  if (existsSync(target)) {
+    const actual = sha256(readFileSync(target));
+    if (actual !== receipt.owned_files[path] && actual !== pending?.before && actual !== pending?.after) {
+      throw new AgentInstallError('modified_owned_file', `Preserve your changes at ${target} before rerunning setup; it will not be overwritten.`);
+    }
+    return actual;
+  }
+  return null;
+}
+
+export function renderLocalInstructions(root: string, sourceId: string, sharedRouter = ''): string {
   const launcher = join(root, 'bin', 'gbrain');
   return `# GBrain memory
 
@@ -151,7 +169,7 @@ Recall relevant memory before answering personal or continuing-work questions. U
 Do not replace the agent's identity. This is one shared local installation, not a boundary between Bots. Memory calls are finite CLI processes. A busy database means another command is running: retry after it finishes; never remove its lock.
 
 Load these instructions as a native saved skill/standing instruction. Confirm that a NEW conversation invokes this executable and recalls a randomized saved fact; platform-native memory alone is not verification. Native installation remains unverified until that test succeeds.
-`;
+${sharedRouter ? `\n${sharedRouter}\n` : ''}`;
 }
 
 export function renderLocalMaintenance(root: string, routineId: string): string {
@@ -165,10 +183,24 @@ Restore with \`backup restore /absolute/path/archive.gbrain-backup --into /absol
 `;
 }
 
+function refuseBelowFloor(identity: ReturnType<typeof artifactFromBundle>, options: AgentSetupOptions, root: string, outcome: string): void {
+  if (bunVersionMeets(identity.bun_version, MINIMUM_BUN_VERSION)) return;
+  const rerunArgs = ['--root', root, '--harness', options.harness, ...(options.adopt ? ['--adopt'] : []), ...(options.upgrade ? ['--upgrade'] : []),
+    ...(options.skills ? ['--skills', options.skills] : []), ...(options.json ? ['--json'] : [])];
+  const rerun = `curl --fail --silent --show-error --location ${SETUP_HELPER_URL} --output /tmp/gbrain-setup.sh && bash /tmp/gbrain-setup.sh ${rerunArgs.map(shellQuote).join(' ')}`;
+  const next = options.upgrade ? 'Make a verified backup first (docs/guides/in-agent-setup.md), then fetch' : 'Fetch';
+  throw new AgentInstallError('runtime_below_floor', `This GBrain release needs Bun ${MINIMUM_BUN_VERSION} or newer, but the setup bundle carries Bun ${identity.bun_version || 'of unknown version'}, so the helper that staged it is out of date. ${outcome} ${next} the current helper and rerun setup: ${rerun}`);
+}
+
 export async function setupInAgent(options: AgentSetupOptions): Promise<AgentSetupResult> {
+  if (options.skills !== undefined && !['follow', 'memory-only'].includes(options.skills)) throw new AgentInstallError('usage', 'The skills policy must be follow or memory-only.');
   const root = checkedRoot(options.root);
   const adapter = harnessAdapter(options.harness);
   if (!['grok-bot', 'muse'].includes(adapter.id) || !adapter.modes.includes('local-cli')) throw new AgentInstallError('unsupported_harness', 'This local setup supports Grok Bot and Muse personal agents.');
+  // A bundle that cannot be read is reported inside the install below, where the receipt journals it.
+  let identity: ReturnType<typeof artifactFromBundle> | undefined;
+  try { identity = artifactFromBundle(options.bundle, options.sourceRef); } catch { identity = undefined; }
+  if (identity) refuseBelowFloor(identity, options, root, 'Nothing was changed.');
   if (!existsSync(dirname(root))) throw new AgentInstallError('parent_missing', 'Create and verify the persistent parent directory first.');
   const existed = existsSync(root);
   if (!existed) mkdirSync(root, { mode: 0o700 });
@@ -200,7 +232,11 @@ export async function setupInAgent(options: AgentSetupOptions): Promise<AgentSet
         initialized: !!options.adopt, adopted: !!options.adopt, created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
         managed_paths: options.adopt ? ['instructions'] : ['memory', 'instructions'], owned_files: {},
         native: { skill_id: '', routine_id: '', verification: 'unverified' }, search_mode_confirmation_required: !options.adopt,
+        ...(options.skills ? { skills_policy: options.skills } : !options.adopt ? { skills_policy: 'follow' as const } : {}),
       };
+      process.stderr.write(receipt.skills_policy === 'follow'
+        ? 'Shared skills: this setup follows the source-scoped brain catalog through an owned router. No identity replacement, automatic capture, scripts, paid calls, or editor grant. Native loading remains manual and unverified. Opt out with --skills memory-only.\n'
+        : 'Shared skills: memory remains available; existing/adopted roots require explicit --skills follow approval before enrollment.\n');
       receipt.native.skill_id = `gbrain-${receipt.installation_id}`;
       receipt.native.routine_id = `gbrain-maintenance-${receipt.installation_id}`;
       writeInstallReceipt(receipt);
@@ -216,9 +252,13 @@ export async function setupInAgent(options: AgentSetupOptions): Promise<AgentSet
       }
       if (!receipt.initialized && hasDb && config.kind === 'absent') throw new AgentInstallError('partial_database', 'Initialization left a database without configuration. Preserve it and recover its configuration before continuing.');
     }
+    if (options.skills) receipt.skills_policy = options.skills;
+    if (receipt.skills_policy === 'follow') ownedFileHash(receipt, 'instructions/gbrain-skill.md');
+    writeInstallReceipt(receipt);
     delete receipt.last_failure;
     let changed = false;
-    const identity = artifactFromBundle(options.bundle, options.sourceRef);
+    identity ??= artifactFromBundle(options.bundle, options.sourceRef);
+    refuseBelowFloor(identity, options, root, 'No runtime was installed.');
     if (receipt.artifact && !options.upgrade && identity.source_ref !== receipt.artifact.source_ref) throw new AgentInstallError('artifact_version_mismatch', 'Repair must use the recorded source commit; use --upgrade to explicitly change versions.');
     const upgrade = !!options.upgrade && receipt.artifact?.source_ref !== identity.source_ref;
     if (!receipt.artifact || upgrade || !artifactUsable(root, receipt.artifact)) {
@@ -242,9 +282,11 @@ export async function setupInAgent(options: AgentSetupOptions): Promise<AgentSet
       await cli(root, artifact, ['init', '--migrate-only', '--non-interactive']);
       receipt.pending_runtime_migration = false; writeInstallReceipt(receipt); changed = true;
     }
+    await cli(root, artifact, ['apply-migrations', '--migration', SHARED_CONTENT_MIGRATION_VERSION, '--yes', '--non-interactive']);
     // A finite database probe also makes a ready receipt prove the installed
     // memory can actually be opened, rather than only that files exist.
     const engine = new PGLiteEngine();
+    let sharedSkills: LocalSharedSkillsResult;
     try {
       await engine.connect({ engine: 'pglite', database_path: receipt.database_path });
       if (!receipt.adopted) await engine.executeRaw(`UPDATE sources SET local_path = $1 WHERE id = $2 AND local_path IS NULL`, [join(root, 'memory'), receipt.source_id]);
@@ -252,6 +294,15 @@ export async function setupInAgent(options: AgentSetupOptions): Promise<AgentSet
       if (!sources.length) throw new AgentInstallError('source_missing', 'Configured source is missing or archived; repair source routing before setup.');
       receipt.schema_version = Number(await engine.getConfig('version'));
       receipt.capabilities = { transport: 'local-cli', engine: 'pglite', finite_database_probe: 'passed', native_runtime: 'unverified' };
+      const localConfig = readFileConfigState(configPath);
+      if (localConfig.kind !== 'present') throw new AgentInstallError('invalid_config', 'The installation config must remain readable.');
+      sharedSkills = await installLocalSharedSkills({ engine, config: localConfig.config, sourceId: receipt.source_id, remote: false,
+        dryRun: false, logger: { info() {}, warn() {}, error() {} } }, {
+        root, harness: receipt.harness, sourceId: receipt.source_id, follow: receipt.skills_policy === 'follow',
+      });
+      if (receipt.skills_policy === undefined) sharedSkills = { ...sharedSkills, status: 'pending', reason: 'follow_approval_required' };
+      receipt.shared_skills = sharedSkills;
+      writeInstallReceipt(receipt);
     } finally { await engine.disconnect(); }
     for (const path of ['bin', 'instructions']) {
       const target = confinedPath(root, path);
@@ -261,7 +312,8 @@ export async function setupInAgent(options: AgentSetupOptions): Promise<AgentSet
     changed = ownFile(receipt, 'bin/gbrain', launcher, 0o700) || changed;
     const setupScript = readFileSync(join(root, artifact.directory, 'app', 'node_modules', 'gbrain', 'scripts', 'setup-in-agent.sh'), 'utf8');
     changed = ownFile(receipt, 'bin/gbrain-setup', setupScript, 0o700) || changed;
-    changed = ownFile(receipt, 'instructions/gbrain-skill.md', renderLocalInstructions(root, receipt.source_id)) || changed;
+    changed = ownFile(receipt, 'instructions/gbrain-skill.md', renderLocalInstructions(root, receipt.source_id,
+      sharedSkills.router_path ? readFileSync(sharedSkills.router_path, 'utf8') : '')) || changed;
     changed = ownFile(receipt, 'instructions/maintenance.md', renderLocalMaintenance(root, receipt.native.routine_id)) || changed;
     receipt.state = 'ready'; writeInstallReceipt(receipt);
     return {
@@ -269,6 +321,7 @@ export async function setupInAgent(options: AgentSetupOptions): Promise<AgentSet
       launcher: join(root, 'bin', 'gbrain'), repair: join(root, 'bin', 'gbrain-setup'), receipt: installReceiptPath(root),
       instructions: join(root, 'instructions', 'gbrain-skill.md'), maintenance: join(root, 'instructions', 'maintenance.md'),
       native_verification: 'unverified', search_mode_confirmation_required: receipt.search_mode_confirmation_required,
+      shared_skills: sharedSkills,
     };
   } catch (error) {
     // Only the lock owner journals a recognized installation; preflight

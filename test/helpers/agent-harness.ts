@@ -421,18 +421,23 @@ export interface ParsedOpencodeJsonl {
   /** Tool names from tool events, in order (MCP tools: `<server>_<tool>`,
    *  e.g. `gbrain_recall` — observed v1.18.18). */
   toolCalls: string[];
+  /** #6049: one line per `error` event: `<name> <statusCode> <responseBody error.type>: <message>`,
+   *  so a turn the provider refused (e.g. a FreeTierError 403) says why instead of an empty reply. */
+  errors: string[];
 }
 
 /**
  * Parse `opencode run --format json` NDJSON. Every event is
  * `{type, timestamp, sessionID, part}` (observed v1.18.18 —
  * OPENCODE-CLI-PIN.md §One-shot): `text` events carry `part.text`;
- * `tool_use` events carry `part.tool` + `part.state.{status,input,output}`.
+ * `tool_use` events carry `part.tool` + `part.state.{status,input,output}`;
+ * `error` events carry `error.{name,data.{message,statusCode,responseBody}}`.
  * Skips malformed lines and unknown event types.
  */
 export function parseOpencodeJsonl(lines: string[]): ParsedOpencodeJsonl {
   const textParts: string[] = [];
   const toolCalls: string[] = [];
+  const errors: string[] = [];
   for (const line of lines) {
     let evt: unknown;
     try {
@@ -441,14 +446,22 @@ export function parseOpencodeJsonl(lines: string[]): ParsedOpencodeJsonl {
       continue;
     }
     if (typeof evt !== 'object' || evt === null) continue;
-    const e = evt as { type?: string; part?: { text?: unknown; tool?: unknown } };
+    const e = evt as { type?: string; part?: { text?: unknown; tool?: unknown };
+      error?: { name?: unknown; data?: { message?: unknown; statusCode?: unknown; responseBody?: unknown } } };
     if (e.type === 'text' && typeof e.part?.text === 'string') {
       textParts.push(e.part.text);
     } else if (e.type === 'tool_use' && typeof e.part?.tool === 'string') {
       toolCalls.push(e.part.tool);
+    } else if (e.type === 'error') {
+      const data = e.error?.data;
+      let bodyType: unknown;
+      try { bodyType = typeof data?.responseBody === 'string' ? JSON.parse(data.responseBody)?.error?.type : undefined; } catch { /* non-JSON body */ }
+      const head = [e.error?.name, data?.statusCode, bodyType].filter((v) => typeof v === 'string' || typeof v === 'number').join(' ');
+      const message = typeof data?.message === 'string' ? data.message : '';
+      errors.push(head && message ? `${head}: ${message}` : head || message || 'error event without details');
     }
   }
-  return { finalText: textParts.join('\n').trim(), toolCalls };
+  return { finalText: textParts.join('\n').trim(), toolCalls, errors };
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -564,6 +577,25 @@ export interface CodexTurnOpts {
    *  to thread GBRAIN_BIN/GBRAIN_HOME/GBRAIN_SOURCE through codex's env_vars
    *  passthrough into the plugin-launched MCP server. */
   extraEnv?: Record<string, string>;
+  /** Explicit approvals for tools on fixture-owned MCP servers only. Neither
+   * global approval policy nor shell sandbox permissions are changed. */
+  mcpToolApprovals?: Array<{ server: string; plugin?: string; tools: readonly string[] }>;
+  /** Wait for the fixture server's bounded startup before presenting tools. */
+  waitForMcpStartup?: boolean;
+}
+
+/** Codex's -c paths use literal dot-separated segments, not TOML quoted keys.
+ * Reject separators so fixture names cannot change the override's scope. */
+export function codexMcpApprovalArgs(approvals: CodexTurnOpts['mcpToolApprovals'] = []): string[] {
+  return approvals.flatMap(({ server, plugin, tools }) => {
+    for (const name of [server, ...(plugin === undefined ? [] : [plugin]), ...tools]) {
+      if (!/^[A-Za-z0-9_@-]+$/.test(name)) throw new Error('Fixture MCP approval names must be single config-path segments');
+    }
+    const prefix = plugin === undefined ? 'mcp_servers' : `plugins.${plugin}.mcp_servers`;
+    return [...new Set(tools)].flatMap((tool) => [
+      '-c', `${prefix}.${server}.tools.${tool}.approval_mode="approve"`,
+    ]);
+  });
 }
 
 export interface CodexTurnResult {
@@ -573,6 +605,7 @@ export interface CodexTurnResult {
   /** MCP tool invocations ({server, tool}) — see ParsedCodexJsonl.mcpToolCalls. */
   mcpToolCalls: Array<{ server: string; tool: string }>;
   rawLines: string[];
+  stderrText: string;
   exitCode: number | null;
   timedOut: boolean;
 }
@@ -604,7 +637,8 @@ export async function codexExecTurn(opts: CodexTurnOpts): Promise<CodexTurnResul
 
   // EV12: spawn the RESOLVED binary (see claudeHeadlessTurn).
   const codexBin = resolveCodexBinary() ?? 'codex';
-  const proc = Bun.spawn([codexBin, 'exec', opts.prompt, '--json', '-s', sandbox], {
+  const startupArgs = opts.waitForMcpStartup ? ['-c', 'mcp_optional_startup_grace_ms=0'] : [];
+  const proc = Bun.spawn([codexBin, ...codexMcpApprovalArgs(opts.mcpToolApprovals), ...startupArgs, 'exec', opts.prompt, '--json', '-s', sandbox], {
     cwd: opts.cwd,
     env: hermeticChildEnv({ HOME: opts.home, ...opts.extraEnv }, { extraAllow: ['OPENAI_API_KEY', 'CODEX_*'] }),
     stdout: 'pipe',
@@ -622,7 +656,7 @@ export async function codexExecTurn(opts: CodexTurnOpts): Promise<CodexTurnResul
   }, timeoutMs);
 
   await stdoutDone;
-  await stderrDone.catch(() => '');
+  const stderrText = await stderrDone.catch(() => '');
   const exitCode = await proc.exited;
   clearTimeout(timer);
 
@@ -633,6 +667,7 @@ export async function codexExecTurn(opts: CodexTurnOpts): Promise<CodexTurnResul
     reasoning: parsed.reasoning,
     mcpToolCalls: parsed.mcpToolCalls,
     rawLines,
+    stderrText,
     exitCode: timedOut ? 124 : exitCode,
     timedOut,
   };
@@ -689,20 +724,28 @@ export interface OneShotSpawnResult {
   exitCode: number | null;
   timedOut: boolean;
   stderrText: string;
+  /** The value abortWhen returned when it ended the run early. */
+  abortReason?: string;
 }
+
+/** How long a killed one-shot child's output may keep draining. */
+const KILL_DRAIN_GRACE_MS = 8_000;
 
 /**
  * Shared one-shot spawn core: timeout → kill, kill(9) escalation after 5s
  * (agents may leave a daemon/MCP-server child holding the pipes open past
- * the parent's death), and a BOUNDED stream drain (timeout + 30s cap) so a
- * grandchild holding the pipe fds can never hang a retry loop. Exit 124 on
- * timeout.
+ * the parent's death), and a BOUNDED stream drain (timeout + 30s cap, or
+ * KILL_DRAIN_GRACE_MS once the child is killed) so a grandchild holding the
+ * pipe fds can never hang a retry loop. Exit 124 on timeout.
  */
 export async function runOneShotSpawn(opts: {
   argv: string[];
   cwd: string;
   env: NodeJS.ProcessEnv;
   timeoutMs: number;
+  /** Polled every second; a returned string kills the child like a timeout
+   *  and comes back as abortReason. */
+  abortWhen?: () => string | undefined;
 }): Promise<OneShotSpawnResult> {
   const proc = Bun.spawn(opts.argv, {
     cwd: opts.cwd,
@@ -713,22 +756,46 @@ export async function runOneShotSpawn(opts: {
   });
 
   let timedOut = false;
-  const timer = setTimeout(() => {
-    timedOut = true;
+  let abortReason: string | undefined;
+  let killed: () => void = () => {};
+  const killedAt = new Promise<void>((r) => { killed = r; });
+  const kill = () => {
+    killed();
     try { proc.kill(); } catch { /* already dead */ }
     setTimeout(() => { try { proc.kill(9); } catch { /* already dead */ } }, 5_000);
+  };
+  const timer = setTimeout(() => {
+    timedOut = true;
+    kill();
   }, opts.timeoutMs);
+  const abortPoll = opts.abortWhen && setInterval(() => {
+    abortReason = opts.abortWhen!();
+    if (abortReason === undefined) return;
+    clearInterval(abortPoll);
+    kill();
+  }, 1_000);
 
   const drainCap = opts.timeoutMs + 30_000;
   // The cap timer is CLEARED when the real promise wins — an uncancelled
   // drainCap timer (timeoutMs + 30s) would keep Bun's event loop alive for
-  // minutes after every successful door run.
+  // minutes after every successful door run. Once the child is killed, a
+  // descendant that kept stdout/stderr open (an MCP server, a provider retry
+  // helper) gets KILL_DRAIN_GRACE_MS, not the rest of drainCap.
   const bounded = <T>(p: Promise<T>, fallback: T): Promise<T> => {
     let capTimer: ReturnType<typeof setTimeout> | undefined;
+    let graceTimer: ReturnType<typeof setTimeout> | undefined;
+    let settled = false;
     const cap = new Promise<T>((r) => {
       capTimer = setTimeout(() => r(fallback), drainCap);
     });
-    return Promise.race([p, cap]).finally(() => clearTimeout(capTimer)) as Promise<T>;
+    const grace = killedAt.then(() => new Promise<T>((r) => {
+      if (!settled) graceTimer = setTimeout(() => r(fallback), KILL_DRAIN_GRACE_MS);
+    }));
+    return Promise.race([p, cap, grace]).finally(() => {
+      settled = true;
+      clearTimeout(capTimer);
+      clearTimeout(graceTimer);
+    }) as Promise<T>;
   };
   const [stdout, stderrText] = await Promise.all([
     bounded(new Response(proc.stdout).text(), ''),
@@ -736,12 +803,14 @@ export async function runOneShotSpawn(opts: {
   ]);
   const exitCode = await bounded(proc.exited, 124);
   clearTimeout(timer);
+  clearInterval(abortPoll);
 
   return {
     finalText: stdout.trim(),
     exitCode: timedOut ? 124 : exitCode,
     timedOut,
     stderrText,
+    ...(abortReason !== undefined ? { abortReason } : {}),
   };
 }
 
@@ -1041,27 +1110,33 @@ export function hasOpencodeAuth(): boolean {
  * Hermetic env for spawning opencode itself: HOME + BOTH XDG dirs redirected
  * (config/auth/data all move — verified on macOS; belt-and-suspenders), the
  * env half of the double autoupdate kill, ANTHROPIC_API_KEY re-admitted
- * explicitly for the paid leg (default-deny stays intact for every other
+ * only with paid: true (default-deny stays intact for every other
  * child). Deletes the OTHER providers' keys (single-auth-source discipline —
  * the paid leg pins an anthropic/* model) and the OPENCODE_CONFIG* trio
  * (observed inert in 1.18.18, but a future release activating them must not
  * let ambient values shadow the hermetic config). GITHUB_* step-metadata
  * scrub via the shared factory.
  */
-export const opencodeChildEnv = makeAgentChildEnv({
+const keylessOpencodeChildEnv = makeAgentChildEnv({
   overrides: (home) => ({
     HOME: home,
     XDG_CONFIG_HOME: path.join(home, '.config'),
     XDG_DATA_HOME: path.join(home, '.local', 'share'),
     OPENCODE_DISABLE_AUTOUPDATE: '1',
-    ANTHROPIC_API_KEY: promotedEnv(process.env).ANTHROPIC_API_KEY?.trim() || undefined,
   }),
   deleteKeys: [
+    'ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL',
     'OPENAI_API_KEY', 'XAI_API_KEY', 'OPENROUTER_API_KEY',
     'GOOGLE_GENERATIVE_AI_API_KEY', 'GEMINI_API_KEY', 'ANTHROPIC_AUTH_TOKEN',
     'OPENCODE_CONFIG', 'OPENCODE_CONFIG_DIR', 'OPENCODE_CONFIG_CONTENT',
   ],
 });
+
+export function opencodeChildEnv(home: string, opts?: { binDir?: string; paid?: boolean }): NodeJS.ProcessEnv {
+  const env = keylessOpencodeChildEnv(home, opts);
+  if (opts?.paid) env.ANTHROPIC_API_KEY = promotedEnv(process.env).ANTHROPIC_API_KEY?.trim() || undefined;
+  return env;
+}
 
 /**
  * Seed a hermetic <XDG_CONFIG_HOME>/opencode/opencode.json BEFORE any
@@ -1100,6 +1175,47 @@ export interface OpencodeTurnOpts {
   /** Staged gbrain bin dir — PATH-prepended so a PATH-resolved registration
    *  resolves when opencode spawns the server during the turn. */
   binDir?: string;
+  paid?: boolean;
+}
+
+export interface OpencodeTurnResult extends OneShotSpawnResult {
+  /** error.error of each main-turn `stream error` opencode logged during this turn. */
+  streamErrors: string[];
+  /** The quota/rate-limit refusal that ended the turn early, if any. */
+  providerRefusal?: string;
+}
+
+/** #6049: opencode answers a quota refusal (free tier: "Free usage limit
+ *  reached", HTTP 429) by retrying after the server's retry-after, hours
+ *  later, with nothing on stdout. Waiting can never produce an answer. A
+ *  provider rate limit ("rate limit exceeded", Anthropic's 429) clears in
+ *  seconds and opencode's retry recovers from it, so it never matches. */
+const OPENCODE_QUOTA_REFUSAL = /usage limit|quota/i;
+
+/** Main-turn (`small=false`) `stream error` lines appended to opencode's
+ *  file log (<XDG_DATA_HOME>/opencode/log) since `offsets` was taken. */
+function opencodeStreamErrorsSince(logDir: string, offsets: Map<string, number>): string[] {
+  let files: string[];
+  try { files = fs.readdirSync(logDir).sort(); } catch { return []; }
+  const errors: string[] = [];
+  for (const name of files) {
+    let text: string;
+    try { text = fs.readFileSync(path.join(logDir, name)).subarray(offsets.get(name) ?? 0).toString('utf-8'); } catch { continue; }
+    for (const line of text.split('\n')) {
+      if (!line.includes('message="stream error"') || !line.includes(' small=false ')) continue;
+      const m = line.match(/error\.error="((?:[^"\\]|\\.)*)"/);
+      errors.push(m ? m[1].replace(/\\(.)/g, '$1') : line);
+    }
+  }
+  return errors;
+}
+
+function opencodeLogOffsets(logDir: string): Map<string, number> {
+  const offsets = new Map<string, number>();
+  try {
+    for (const name of fs.readdirSync(logDir)) offsets.set(name, fs.statSync(path.join(logDir, name)).size);
+  } catch { /* no log yet */ }
+  return offsets;
 }
 
 /**
@@ -1107,21 +1223,31 @@ export interface OpencodeTurnOpts {
  * format prints the final answer ALONE on stdout (banner/UI on stderr —
  * observed); no permission flag is needed for MCP tool calls (observed:
  * --auto not passed, deliberately). Shared spawn core: kill(9) escalation +
- * bounded drain.
+ * bounded drain. Provider stream errors come from opencode's own file log;
+ * a quota refusal ends the turn at once instead of at the timeout.
  */
-export async function opencodeOneShotTurn(opts: OpencodeTurnOpts): Promise<OneShotSpawnResult> {
+export async function opencodeOneShotTurn(opts: OpencodeTurnOpts): Promise<OpencodeTurnResult> {
   const bin = resolveOpencodeBinary();
   if (!bin) throw new Error('opencodeOneShotTurn: opencode binary not found');
-  return runOneShotSpawn({
+  const logDir = path.join(opts.home, '.local', 'share', 'opencode', 'log');
+  const offsets = opencodeLogOffsets(logDir);
+  const res = await runOneShotSpawn({
     argv: [
-      bin, 'run', opts.prompt,
+      bin, 'run', opts.prompt, '--pure',
       '--format', opts.format ?? 'default',
       ...(opts.model ? ['-m', opts.model] : []),
     ],
     cwd: opts.cwd,
-    env: opencodeChildEnv(opts.home, { binDir: opts.binDir }),
+    env: opencodeChildEnv(opts.home, { binDir: opts.binDir, paid: opts.paid }),
     timeoutMs: opts.timeoutMs ?? 240_000,
+    abortWhen: () => opencodeStreamErrorsSince(logDir, offsets).find((e) => OPENCODE_QUOTA_REFUSAL.test(e)),
   });
+  const { abortReason, ...rest } = res;
+  return {
+    ...rest,
+    streamErrors: opencodeStreamErrorsSince(logDir, offsets),
+    ...(abortReason !== undefined ? { providerRefusal: abortReason } : {}),
+  };
 }
 
 // ────────────────────────────────────────────────────────────────────────────

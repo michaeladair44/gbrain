@@ -36,8 +36,9 @@
  *      │     column           │ │                      │ │ col: quoted ident   │
  *      │  → 'embedding'       │ │                      │ │  "<name>" (D12)     │
  *      │                      │ │                      │ │ castSql:            │
- *      │ Returns Resolved-    │ │                      │ │  '$1::vector' OR    │
- *      │ Column descriptor.   │ │                      │ │  '$1::halfvec(N)'   │
+ *      │ Returns Resolved-    │ │                      │ │  '$1::text::vector' │
+ *      │ Column descriptor.   │ │                      │ │  OR '$1::text::     │
+ *      │                      │ │                      │ │  halfvec(N)'        │
  *      └──────────┬───────────┘ └──────────────────────┘ └─────────────────────┘
  *                 │
  *                 ▼  (descriptor passed to engines + cosineReScore)
@@ -247,8 +248,12 @@ export function quoteIdentifier(name: string): string {
  * Returns:
  *   col      — identifier-quoted column name for SELECT / WHERE / ORDER BY.
  *   castSql  — placeholder cast for the query vector parameter:
- *                '$1::vector'           for type='vector'
- *                '$1::halfvec(<dims>)'  for type='halfvec'
+ *                '$1::text::vector'           for type='vector'
+ *                '$1::text::halfvec(<dims>)'  for type='halfvec'
+ *              The parameter is bound as text (GBRA-156): the vendored
+ *              driver shares only built-in parameter types across a pool's
+ *              connections, so a vector-typed parameter cost a describe
+ *              round trip on every run under a transaction-mode pooler.
  *
  * Callers interpolate both into the SQL string. The `$1` is the
  * positional parameter that postgres.js / PGLite will bind the query
@@ -261,7 +266,7 @@ export function buildVectorCastFragment(resolved: ResolvedColumn): {
   col: string;
   castSql: string;
 } {
-  return { col: quoteIdentifier(resolved.name), castSql: `$1${vectorCastSuffix(resolved)}` };
+  return { col: quoteIdentifier(resolved.name), castSql: `$1::text${vectorCastSuffix(resolved)}` };
 }
 
 /**
@@ -315,18 +320,20 @@ export function getEmbeddingColumnRegistry(
   // unit tests that exercise the registry without booting the gateway).
   let gwModel: string | undefined;
   let gwDims: number | undefined;
+  let unresolvedIdentity = !cfg.embedding_model?.trim() && !!(cfg.database_path || cfg.database_url);
   try {
     // Dynamic import avoids a static cycle (gateway can transitively
     // depend on this module via search/hybrid.ts → search/embedding-column.ts).
     // require() is synchronous here because we're already on a hot path.
     const gw = require('../ai/gateway.ts') as typeof import('../ai/gateway.ts');
+    unresolvedIdentity ||= gw.requireConfig().embedding_identity_unverified === true;
     gwModel = gw.getEmbeddingModel();
     gwDims = gw.getEmbeddingDimensions();
   } catch {
     // Gateway unconfigured or import cycle — fall through to the
     // canonical default in `ai/defaults.ts`.
   }
-  const embedModel = cfg.embedding_model ?? gwModel ?? DEFAULT_EMBEDDING_MODEL;
+  const embedModel = cfg.embedding_model ?? (unresolvedIdentity ? '' : gwModel ?? DEFAULT_EMBEDDING_MODEL);
   const embedDims =
     typeof cfg.embedding_dimensions === 'number' && cfg.embedding_dimensions > 0
       ? cfg.embedding_dimensions
@@ -487,11 +494,14 @@ export function isDefaultColumn(resolved: ResolvedColumn): boolean {
  */
 export function isCacheSafe(resolved: ResolvedColumn, cfg: GBrainConfig): boolean {
   if (resolved.name !== DEFAULT_COLUMN_NAME) return false;
+  if (!resolved.embeddingModel) return false;
+  if (!cfg.embedding_model?.trim() && (cfg.database_path || cfg.database_url)) return false;
   // v0.37 fix wave: same resolution chain as the registry — cfg > gateway > default.
   let gwModel: string | undefined;
   let gwDims: number | undefined;
   try {
     const gw = require('../ai/gateway.ts') as typeof import('../ai/gateway.ts');
+    if (gw.requireConfig().embedding_identity_unverified && !cfg.embedding_model?.trim()) return false;
     gwModel = gw.getEmbeddingModel();
     gwDims = gw.getEmbeddingDimensions();
   } catch { /* gateway unconfigured — fall through to constants */ }
@@ -529,7 +539,7 @@ export function isBuiltinColumn(name: string): name is BuiltinKey {
  *     accepted at the engine layer (per D11 — engine purity).
  *
  * `dims` for the 'embedding' builtin is hardcoded 1536 here purely as
- * a no-op placeholder; the engine's SQL cast is `$1::vector` (no
+ * a no-op placeholder; the engine's SQL cast is `$1::text::vector` (no
  * parenthesized N) when type='vector', so the dims field is unused by
  * `buildVectorCastFragment` and never touches the wire. Tests that
  * care about dims should pass a real descriptor.
@@ -552,7 +562,7 @@ export function normalizeEngineColumn(
     return {
       name: 'embedding',
       type: 'vector',
-      dimensions: 1536, // placeholder — not used by $1::vector cast
+      dimensions: 1536, // placeholder — not used by $1::text::vector cast
       embeddingModel: '', // engine doesn't embed; left blank
     };
   }

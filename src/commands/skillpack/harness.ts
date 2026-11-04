@@ -11,8 +11,8 @@
  * import level deep). Spell foreign (non-skillpack) CLI flags WITHOUT
  * leading dashes — including in stub/preflight hint text. Deliberately does
  * NOT import src/mcp/surface.ts (its comments carry serve-flag tokens that
- * would bleed into this command's allowlist); the "get_skill is not on the
- * starter surface" fact is hardcoded here and pinned by a contract test.
+ * would bleed into this command's allowlist); skill discovery is available
+ * on starter/full, while the seven-verb surface remains memory-only.
  */
 
 import { existsSync, readFileSync } from 'fs';
@@ -37,6 +37,7 @@ import {
   removeHarnessBridge,
   verifySlugsServable,
   assertDestNotSymlink,
+  ownedBridgeSlugs,
   type BridgeHarness,
 } from '../../core/skillpack/harness-bridge.ts';
 import {
@@ -55,6 +56,14 @@ import { CopyError } from '../../core/skillpack/copy.ts';
 import { runScaffold, ScaffoldError } from '../../core/skillpack/scaffold.ts';
 import { BundleError, bundledSkillSlugs, loadBundleManifest } from '../../core/skillpack/bundle.ts';
 import { findGbrainOrDie, resolveAbs, resolveWorkspace } from './shared.ts';
+import { installSharedBrainBridge } from '../../core/skillpack/shared-brain-bridge.ts';
+import { nativeSharedSkillsDirectory } from '../../core/harness/native-router.ts';
+import { confinedSkillChildWrite } from '../../core/skillpack/writer-guard.ts';
+
+/** OpenClaw's default: the brain-first core. OpenClaw lists every workspace
+ * skill's description in every prompt, so the full bundle (`all`) cost about
+ * 61k input tokens per trial in the HARN-5 install ladder and was never called. */
+const OPENCLAW_CORE_SKILLS = ['brain-ops', 'capture', 'data-loss-gate', 'query', 'resolve-before-asking'];
 
 const DEFAULT_PERSONA: Record<Exclude<BridgeHarness, 'openclaw'>, string> = {
   'claude-code': 'coding-agent',
@@ -74,11 +83,12 @@ interface HarnessArgs {
   json: boolean;
   all: boolean;
   applyCleanHunks: boolean;
+  skillsPolicy?: 'follow' | 'memory-only';
   /** Bare (non-flag) tokens, in order — e.g. reference's <slug>. */
   positional: string[];
 }
 
-const VALUE_FLAGS = new Set(['--harness', '--persona', '--skill', '--dest', '--scope', '--workspace']);
+const VALUE_FLAGS = new Set(['--harness', '--persona', '--skill', '--dest', '--scope', '--workspace', '--skills']);
 const BOOL_FLAGS = new Set(['--stub', '--dry-run', '--json', '--all', '--apply-clean-hunks', '--help', '-h']);
 
 function parseHarnessArgs(args: string[], cmd: string): HarnessArgs {
@@ -88,6 +98,7 @@ function parseHarnessArgs(args: string[], cmd: string): HarnessArgs {
   let dest: string | null = null;
   let scope: 'user' | 'project' = 'user';
   let workspace: string | null = null;
+  let skillsPolicy: HarnessArgs['skillsPolicy'];
   const positional: string[] = [];
 
   const assign = (flag: string, value: string | null): void => {
@@ -117,6 +128,13 @@ function parseHarnessArgs(args: string[], cmd: string): HarnessArgs {
         break;
       case '--workspace':
         workspace = value;
+        break;
+      case '--skills':
+        if (value !== 'follow' && value !== 'memory-only') {
+          console.error('Error: --skills must be follow or memory-only.');
+          process.exit(2);
+        }
+        skillsPolicy = value;
         break;
     }
   };
@@ -164,6 +182,7 @@ function parseHarnessArgs(args: string[], cmd: string): HarnessArgs {
     json: args.includes('--json'),
     all: args.includes('--all'),
     applyCleanHunks: args.includes('--apply-clean-hunks'),
+    skillsPolicy,
     positional,
   };
 }
@@ -203,13 +222,8 @@ function resolveSlugs(gbrainRoot: string, a: HarnessArgs): { slugs: string[]; pe
     validateSlugsAgainstLane(gbrainRoot, a.skills);
     return { slugs: [...new Set(a.skills)].sort(), persona: null };
   }
-  const persona =
-    a.persona ??
-    (a.all
-      ? 'all'
-      : a.harness === 'openclaw'
-        ? 'all'
-        : DEFAULT_PERSONA[a.harness as Exclude<BridgeHarness, 'openclaw'>]);
+  if (a.harness === 'openclaw' && a.persona === null && !a.all) return { slugs: OPENCLAW_CORE_SKILLS, persona: 'core' };
+  const persona = a.persona ?? (a.all ? 'all' : DEFAULT_PERSONA[a.harness as Exclude<BridgeHarness, 'openclaw'>]);
   return { slugs: resolvePersonaSlugs(gbrainRoot, persona), persona };
 }
 
@@ -220,6 +234,7 @@ function resolveSlugs(gbrainRoot: string, a: HarnessArgs): { slugs: string[]; pe
  */
 async function withBestEffortEngine<T>(fn: (engine: BrainEngine | null) => Promise<T>): Promise<T> {
   const config = loadConfig();
+  if (config?.remote_mcp) return fn(null);
   let engine: BrainEngine | null = null;
   if (config) {
     try {
@@ -257,9 +272,8 @@ async function dualPlaneConfig(engine: BrainEngine | null, key: string): Promise
  *      a stub pointing at a gated op is a dead pointer.
  *   2. Every requested slug must be servable from the skills dir the MCP
  *      server would resolve (mcp.skills_dir override, else auto-detect).
- *   3. Best-effort surface warn: get_skill is only exposed on the full MCP
- *      surface (it is NOT in the starter set, and the plugin lanes serve
- *      starter; a contract test pins this fact). This check reads LOCAL
+ *   3. Best-effort surface warn: get_skill is exposed on starter/full, but
+ *      not the seven-verb surface. This check reads LOCAL
  *      config only — it cannot see a plugin manifest's hard-coded surface
  *      or a remote server's ceiling.
  */
@@ -305,12 +319,12 @@ async function stubPreflight(gbrainRoot: string, slugs: readonly string[]): Prom
     // (3) surface warn — best-effort, local config only.
     const dbSurface = await dualPlaneConfig(engine, 'mcp_surface');
     const surface = dbSurface ?? (config as { mcp_surface?: string } | null)?.mcp_surface;
-    if (surface === 'starter' || surface === 'verbs') {
+    if (surface === 'verbs') {
       console.error(
         `warn: your configured MCP surface is '${surface}', which does not expose get_skill\n` +
-          '      (skills ops are full-surface only). The stubs will be dead pointers on that\n' +
-          '      server until it restarts with surface full. Note this check reads local\n' +
-          '      config only — plugin-lane servers hard-code the starter surface.',
+          '      The stubs need surface starter or full, plus explicit operation grants\n' +
+          '      and skill publishing. This check reads local configuration only;\n' +
+          '      inspect the actual connection capabilities after restarting.',
       );
     }
   });
@@ -325,12 +339,13 @@ export async function cmdScaffoldHarness(args: string[]): Promise<void> {
     console.log(
       'gbrain skillpack scaffold --harness <claude-code|openclaw|codex|opencode>\n' +
         '    [--persona <name>|all] [--skill <slug>]... [--dest PATH] [--scope user|project]\n' +
-        '    [--stub] [--workspace PATH] [--dry-run] [--json]\n\n' +
+        '    [--stub] [--workspace PATH] [--skills follow|memory-only] [--dry-run] [--json]\n\n' +
         'Install a persona-curated set of bundled skills into a harness\'s native\n' +
         'skills dir. Additive; never overwrites your files (local edits win).\n\n' +
         '  --persona      Named curation from skills/plugin-lanes.json#personas,\n' +
         '                 or `all` for the full plugin lane. Defaults: claude-code/\n' +
-        '                 codex/opencode → coding-agent; openclaw → all.\n' +
+        '                 codex/opencode → coding-agent; openclaw → the five-skill\n' +
+        '                 brain-first core (--all for the full bundle).\n' +
         '  --all          Shorthand for the full plugin lane (same as persona all).\n' +
         '  --skill        Explicit slug picks (repeatable; overrides --persona).\n' +
         '  --dest         Install dir override. Required for codex/opencode (no\n' +
@@ -339,6 +354,9 @@ export async function cmdScaffoldHarness(args: string[]): Promise<void> {
         '                 dir; project → <workspace>/.claude/skills.\n' +
         '  --stub         Cold-pull mode: install pointer SKILL.md files that fetch\n' +
         '                 the body via the gbrain MCP get_skill op (preflight-gated).\n' +
+        '  --skills       Explicitly follow the active shared catalog through its\n' +
+        '                 source-bound router, or select memory-only. Existing\n' +
+        '                 copied skills require a separate reviewed migration.\n' +
         '  --dry-run      Plan + report; no writes.\n',
     );
     process.exit(0);
@@ -350,9 +368,17 @@ export async function cmdScaffoldHarness(args: string[]): Promise<void> {
     );
     process.exit(2);
   }
-  const gbrainRoot = findGbrainOrDie();
-
   try {
+    const shared = await withBestEffortEngine(engine => installSharedBrainBridge({ engine, config: loadConfig(), harness: a.harness,
+      policy: a.skillsPolicy, dryRun: a.dryRun,
+      dest: a.dest ? resolveAbs(a.dest) : a.harness === 'claude-code' ? resolveDest(a)
+        : a.harness === 'openclaw' && a.workspace ? confinedSkillChildWrite(resolveAbs(a.workspace), 'skills', { dryRun: a.dryRun }) : nativeSharedSkillsDirectory(a.harness) ?? undefined }));
+    if (shared) {
+      if (a.json) console.log(JSON.stringify({ ok: true, harness: a.harness, dryRun: a.dryRun, ...shared }, null, 2));
+      else console.log(`shared skills: ${shared.status} (${shared.reason})\n${shared.next_action}`);
+      process.exit(0);
+    }
+    const gbrainRoot = findGbrainOrDie();
     // openclaw: the workspace scaffold IS the native install — delegate with
     // persona filtering. Stub mode is refused (openclaw users are the brain
     // host; the full bodies live next to the brain anyway).
@@ -367,7 +393,7 @@ export async function cmdScaffoldHarness(args: string[]): Promise<void> {
       }
       const targetWorkspace = resolveWorkspace({ workspace: a.workspace });
       const { slugs, persona } = resolveSlugs(gbrainRoot, a);
-      const useFullBundle = a.skills.length === 0 && (a.persona === null || a.persona === 'all');
+      const useFullBundle = persona === 'all';
       // The workspace scaffold enumerates the OPENCLAW universe (paired
       // sources included) — plugin-lane ADDITIONS don't exist there, so a
       // persona slug outside openclaw.plugin.json#skills must be reported,
@@ -385,8 +411,8 @@ export async function cmdScaffoldHarness(args: string[]): Promise<void> {
         gbrainRoot,
         targetWorkspace,
         skillSlug: null,
-        // Full bundle (openclaw's default, today's behavior) enumerates the
-        // openclaw universe directly; persona/skill picks filter it.
+        // The full bundle (--all) enumerates the openclaw universe directly;
+        // the core default, persona and skill picks filter it.
         ...(useFullBundle ? {} : { skillSlugs: deliverable }),
         dryRun: a.dryRun,
       });
@@ -485,7 +511,8 @@ export async function cmdScaffoldHarness(args: string[]): Promise<void> {
           `prefer one lane per machine.`,
       );
       if (!a.dryRun && result.summary.wroteNew > 0) {
-        console.log(`\nUpdate lens: gbrain skillpack reference --harness ${a.harness} | remove: gbrain skillpack remove --harness ${a.harness}`);
+        const target = `${a.dest ? ` --dest ${a.dest}` : ''}${a.scope === 'project' ? ' --scope project' : ''}${a.workspace ? ` --workspace ${a.workspace}` : ''}`;
+        console.log(`\nUpdate lens: gbrain skillpack reference --harness ${a.harness}${target} | remove: gbrain skillpack remove --harness ${a.harness}${target}`);
       }
     }
     process.exit(0);
@@ -528,8 +555,8 @@ export async function cmdReferenceHarness(args: string[]): Promise<void> {
       ? [positional]
       : a.skills.length > 0
         ? a.skills
-        : entry && Object.keys(entry.written).length > 0
-          ? Object.keys(entry.written).sort()
+        : ownedBridgeSlugs(entry).length > 0
+          ? ownedBridgeSlugs(entry)
           : resolveSlugs(gbrainRoot, a).slugs;
 
     if (a.applyCleanHunks) {
@@ -593,7 +620,9 @@ export async function cmdRemove(args: string[]): Promise<void> {
         'Remove files the harness bridge WROTE (the bridge-state ledger) — never\n' +
         'your own files: pre-existing and locally-created files were never\n' +
         'recorded as owned. Without --skill, removes every owned skill for the\n' +
-        '(harness, dest). Shared convention files stay (other skills use them).\n\n' +
+        '(harness, dest). Shared convention files stay (other skills use them);\n' +
+        'once no owned skill is left, the shared-skills migration no longer\n' +
+        'counts them as legacy copies.\n\n' +
         'This is NOT the removed-in-v0.33 workspace uninstall: workspace scaffolds\n' +
         'are user-owned outright (delete their directories yourself).',
     );
@@ -680,9 +709,7 @@ export function collectBridgesStatus(gbrainRoot: string): BridgesStatusEntry[] {
   const state = loadBridgeState();
   const out: BridgesStatusEntry[] = [];
   for (const entry of state.entries) {
-    const slugs = Object.keys(entry.written)
-      .filter(s => s !== '_shared')
-      .sort();
+    const slugs = ownedBridgeSlugs(entry);
     let identical = 0;
     let differs = 0;
     let missing = 0;
