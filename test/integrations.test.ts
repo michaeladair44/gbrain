@@ -244,6 +244,36 @@ describe('x-to-brain recipe', () => {
   });
 });
 
+describe('meeting-sync recipe', () => {
+  // Circleback answers 426 "CLI version out of date" to API-key requests that
+  // don't name a supported @circleback/cli version, so a Bearer-only check fails
+  // for every user.
+  test('Circleback API check and Step 1 curl send x-circleback-cli-version', () => {
+    const { readFileSync } = require('fs');
+    const content = readFileSync(resolve(RECIPES_DIR, 'meeting-sync.md'), 'utf-8');
+    const recipe = parseRecipe(content, 'meeting-sync.md');
+    expect(recipe).not.toBeNull();
+    const check = recipe!.frontmatter.health_checks
+      .find((c: any) => typeof c === 'object' && c.type === 'http') as any;
+    expect(check).toBeDefined();
+    expect(check.headers['x-circleback-cli-version']).toMatch(/^\d+\.\d+\.\d+$/);
+    expect(check.headers.Authorization).toBe('Bearer $CIRCLEBACK_TOKEN');
+    expect(content).toMatch(/curl[^\n]*\n\s*-H "x-circleback-cli-version: \d+\.\d+\.\d+"/);
+  });
+
+  // The endpoint is MCP over streamable HTTP: without an Accept header naming
+  // both application/json and text/event-stream it answers 406.
+  test('Circleback API check and Step 1 curl accept JSON and event-stream', () => {
+    const { readFileSync } = require('fs');
+    const content = readFileSync(resolve(RECIPES_DIR, 'meeting-sync.md'), 'utf-8');
+    const recipe = parseRecipe(content, 'meeting-sync.md');
+    const check = recipe!.frontmatter.health_checks
+      .find((c: any) => typeof c === 'object' && c.type === 'http') as any;
+    expect(check.headers.Accept).toBe('application/json, text/event-stream');
+    expect(content).toContain('-H "Accept: application/json, text/event-stream"');
+  });
+});
+
 // --- All recipes parse without error ---
 
 describe('all recipes', () => {

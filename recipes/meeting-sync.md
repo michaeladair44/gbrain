@@ -16,6 +16,8 @@ health_checks:
     headers:
       Authorization: "Bearer $CIRCLEBACK_TOKEN"
       Content-Type: "application/json"
+      Accept: "application/json, text/event-stream"
+      x-circleback-cli-version: "0.3.5"
     body: '{"jsonrpc":"2.0","method":"tools/list","id":1}'
     label: "Circleback API"
 output_paths:
@@ -138,8 +140,10 @@ is unlimited. You need at least one recorded meeting for the sync to work."
 Validate immediately:
 ```bash
 curl -sf -H "Authorization: Bearer $CIRCLEBACK_TOKEN" \
+  -H "x-circleback-cli-version: 0.3.5" \
   "https://app.circleback.ai/api/mcp" \
   -X POST -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
   -d '{"jsonrpc":"2.0","method":"tools/list","id":1}' \
   | grep -q '"result"' \
   && echo "PASS: Circleback API connected" \
@@ -251,7 +255,8 @@ call_circleback(tool_name, args):
           params: {name: tool_name, arguments: args}}
 
   res = POST CIRCLEBACK_ENDPOINT, body,
-        headers: {Authorization: Bearer TOKEN, Accept: 'application/json, text/event-stream'}
+        headers: {Authorization: Bearer TOKEN, Accept: 'application/json, text/event-stream',
+                  'x-circleback-cli-version': '0.3.5'}
 
   text = res.text()
   for line in text.split('\n'):
@@ -262,6 +267,9 @@ call_circleback(tool_name, args):
       if json.error:
         throw json.error
 ```
+
+**Non-obvious:** Circleback API keys (`cb_...`) also need an `x-circleback-cli-version` header naming a
+supported `@circleback/cli` version. Without it the endpoint answers HTTP 426 "CLI version out of date".
 
 **Non-obvious:** The response is JSON inside SSE inside JSONRPC. You have to:
 1. Strip `data: ` prefix
@@ -384,6 +392,14 @@ push ([outcomes](../docs/guides/shared-checkout-git.md#outcomes)).
 - Check that Circleback has recorded meetings (open the Circleback dashboard)
 - The Circleback bot must join the meeting for recording to work
 - Check the date range: `--days 30` to widen the search
+
+**HTTP 426 "CLI version out of date":**
+- Circleback raised the minimum CLI version it accepts. Set `x-circleback-cli-version` (health check,
+  Step 1 curl, sync script) to the current version: `npm view @circleback/cli version`
+
+**HTTP 406 "Not Acceptable":**
+- The endpoint is MCP over streamable HTTP and only answers a request whose `Accept` header lists both
+  `application/json` and `text/event-stream`. Add that header (health check, Step 1 curl, sync script).
 
 **Transcript is empty:**
 - Some meetings may not have transcripts (e.g., no audio, bot was removed)
