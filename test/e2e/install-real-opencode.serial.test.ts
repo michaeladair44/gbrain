@@ -10,17 +10,19 @@
  * against v1.18.18 — see docs/mcp/OPENCODE-CLI-PIN.md; update that file, the
  * heavy-tests opencode-door pins, and these assertions together.
  *
- * SPLIT GATING (a step beyond the grok door, deliberate): opencode's
- * anonymous FREE TIER answers headless runs AND drives MCP tool calls with
- * zero credentials (observed — load-bearing), so even the nonce SMOKE runs
- * keyless. Two describes:
+ * SPLIT GATING: opencode's anonymous FREE TIER answers headless runs AND
+ * drives MCP tool calls with zero credentials, but since 2026-11 it caps
+ * free usage per IP, and datacenter runners hit the cap (#6049). So the
+ * nonce SMOKE that gates is the paid T5; the free-tier T4 runs only where
+ * it is requested (the non-gating canary). Two describes:
  *   - keyless tier (T1 version pin, T2 INSTALL + list handshake, T2b
- *     spawn-gate canary, T3 writer parity + preservation, T4 free-tier
- *     SMOKE): GBRAIN_REAL_OPENCODE_E2E=1 + resolvable binary.
- *   - paid tier (T5 anthropic leg): additionally hasOpencodeAuth()
- *     (non-empty ANTHROPIC_API_KEY; blank CI secret ⇒ skip, never a paid
- *     failure). Self-validating: the authed `opencode models` list must
- *     carry the pinned model id BEFORE any spend.
+ *     spawn-gate canary, T3 writer parity + preservation):
+ *     GBRAIN_REAL_OPENCODE_E2E=1 + resolvable binary. T4 free-tier SMOKE
+ *     additionally needs GBRAIN_REAL_OPENCODE_FREE_TIER_E2E=1.
+ *   - paid tier (T5 anthropic leg): additionally GBRAIN_REAL_OPENCODE_PAID_E2E=1
+ *     and hasOpencodeAuth(). Unrequested coverage skips; requested coverage
+ *     without credentials fails. The authed `opencode models --refresh` list
+ *     must carry the pinned model id BEFORE any spend.
  *
  * Isolation: every child gets HOME=<tmp> + XDG_CONFIG_HOME + XDG_DATA_HOME
  * under the tmp home (full XDG honoring verified on macOS) and an explicit
@@ -73,12 +75,18 @@ const REPO_ROOT = resolve(import.meta.dir, '..', '..');
 const CLI = join(REPO_ROOT, 'src', 'cli.ts');
 const OPENCODE_BIN = resolveOpencodeBinary();
 const CAN_RUN_KEYLESS = process.env.GBRAIN_REAL_OPENCODE_E2E === '1' && !!OPENCODE_BIN;
-const CAN_RUN_PAID = CAN_RUN_KEYLESS && hasOpencodeAuth();
+const PAID_REQUESTED = process.env.GBRAIN_REAL_OPENCODE_PAID_E2E === '1';
+const FREE_TIER_REQUESTED = process.env.GBRAIN_REAL_OPENCODE_FREE_TIER_E2E === '1';
+const CAN_RUN_PAID = CAN_RUN_KEYLESS && PAID_REQUESTED && hasOpencodeAuth();
+
+if (CAN_RUN_KEYLESS && PAID_REQUESTED && !hasOpencodeAuth()) {
+  throw new Error('OpenCode paid tier explicitly requested but ANTHROPIC_API_KEY is missing; no paid turn ran');
+}
 
 /** Pinned anthropic model for the paid leg (provider/model, models.dev
- *  convention). PROVISIONAL until the authed models list confirms it — the
- *  T5 models-gate asserts presence BEFORE any spend and names the fix. */
-const PAID_MODEL = 'anthropic/claude-haiku-4-5';
+ *  convention): the current Haiku generation. The T5 models-gate asserts
+ *  presence in the refreshed authed list BEFORE any spend and names the fix. */
+const PAID_MODEL = 'anthropic/claude-haiku-5-5';
 
 if (!CAN_RUN_KEYLESS) {
   const why = process.env.GBRAIN_REAL_OPENCODE_E2E !== '1'
@@ -86,7 +94,7 @@ if (!CAN_RUN_KEYLESS) {
     : 'opencode binary not found';
   console.warn(`[install-real-opencode] SKIP (keyless tier): ${why}`);
 } else if (!CAN_RUN_PAID) {
-  console.warn('[install-real-opencode] keyless tier runs; SKIP paid tier: no non-empty ANTHROPIC_API_KEY');
+  console.warn('[install-real-opencode] keyless tier runs; SKIP paid tier: GBRAIN_REAL_OPENCODE_PAID_E2E=1 and a non-empty ANTHROPIC_API_KEY are required');
 }
 
 const ENV_KEYS = [
@@ -217,6 +225,7 @@ function runOpencode(
   cwd: string,
   argv: string[],
   binDir?: string,
+  paid = false,
 ): { code: number | null; stdout: string; stderr: string } {
   // `--pure` must land on OPENCODE's argv, never inside a `--`-delimited
   // server command (a trailing append after `mcp add … -- gbrain serve`
@@ -225,7 +234,7 @@ function runOpencode(
   const withPure = sep === -1 ? [...argv, '--pure'] : [...argv.slice(0, sep), '--pure', ...argv.slice(sep)];
   const res = spawnSync(OPENCODE_BIN!, withPure, {
     cwd,
-    env: opencodeChildEnv(home, binDir ? { binDir } : undefined),
+    env: opencodeChildEnv(home, { binDir, paid }),
     encoding: 'utf8',
     timeout: 180_000,
   });
@@ -397,7 +406,7 @@ describe.skipIf(!CAN_RUN_KEYLESS)('install real-opencode door — keyless tier (
     expect((cfg2.mcp as Record<string, unknown>)['door-second']).toBeDefined();
   }, 300_000);
 
-  test('T4 SMOKE (keyless free tier): per-run nonce recalled via a STRUCTURAL gbrain tool_use event', async () => {
+  test.skipIf(!FREE_TIER_REQUESTED)('T4 SMOKE (keyless free tier): per-run nonce recalled via a STRUCTURAL gbrain tool_use event', async () => {
     const home = trackHome('smoke');
     seedOpencodeConfig(home);
     const ws = join(home, 'ws');
@@ -433,6 +442,7 @@ describe.skipIf(!CAN_RUN_KEYLESS)('install real-opencode door — keyless tier (
     // a transient 5xx must not red the door; asserts NEVER soften.
     let finalText = '';
     let toolCalls: string[] = [];
+    let errors: string[] = [];
     for (let attempt = 1; attempt <= 2; attempt++) {
       const turn = await opencodeOneShotTurn({
         prompt,
@@ -445,11 +455,17 @@ describe.skipIf(!CAN_RUN_KEYLESS)('install real-opencode door — keyless tier (
       const parsed = parseOpencodeJsonl(turn.finalText.split('\n'));
       finalText = parsed.finalText;
       toolCalls = parsed.toolCalls;
+      errors = [...parsed.errors, ...turn.streamErrors];
       try { writeFileSync(join(home, 'door-turn.jsonl'), turn.finalText); } catch { /* evidence */ }
       if (turn.exitCode === 0 && finalText.includes(nonce)) break;
+      // A quota refusal is not transient: a second turn only spends more of the same quota.
+      if (turn.providerRefusal) break;
       if (attempt === 1) await new Promise((r) => setTimeout(r, 3_000));
     }
 
+    // #6049: a turn the provider refused (a FreeTierError 403, or the free tier's "Free usage limit
+    // reached" quota that opencode retries silently for hours) fails with its own message, not `Received: ""`.
+    if (!finalText.includes(nonce) && errors.length) throw new Error(`opencode turn ended with provider error(s): ${errors.join('; ')}`);
     expect(finalText).toContain(nonce);
     expect(finalText).not.toContain('NO-GBRAIN-TOOL');
     // Structural tool-mediation proof: at least one gbrain MCP tool fired
@@ -467,7 +483,9 @@ describe.skipIf(!CAN_RUN_PAID)('install real-opencode door — paid tier (anthro
 
     // Self-validating gate: never spend against a guessed model id. When
     // this fails, update PAID_MODEL from this authed list + the PIN doc.
-    const models = runOpencode(home, ws, ['models']);
+    // --refresh reads models.dev now: the binary's bundled catalog predates
+    // the current Haiku generation.
+    const models = runOpencode(home, ws, ['models', '--refresh'], undefined, true);
     expect(models.code).toBe(0);
     if (!models.stdout.includes(PAID_MODEL)) {
       throw new Error(
@@ -496,10 +514,19 @@ describe.skipIf(!CAN_RUN_PAID)('install real-opencode door — paid tier (anthro
       home,
       timeoutMs: 240_000,
       model: PAID_MODEL,
+      format: 'json',
       binDir,
+      paid: true,
     });
+    try { writeFileSync(join(home, 'door-turn.jsonl'), turn.finalText); } catch { /* evidence */ }
+    const parsed = parseOpencodeJsonl(turn.finalText.split('\n'));
+    const errors = [...parsed.errors, ...turn.streamErrors];
+    if (!parsed.finalText.includes(nonce) && errors.length) throw new Error(`opencode turn ended with provider error(s): ${errors.join('; ')}`);
     expect(turn.exitCode).toBe(0);
-    expect(turn.finalText).toContain(nonce);
-    expect(turn.finalText).not.toContain('NO-GBRAIN-TOOL');
+    expect(parsed.finalText).toContain(nonce);
+    expect(parsed.finalText).not.toContain('NO-GBRAIN-TOOL');
+    // opencode also has fs/shell tools, so the nonce alone does not prove the
+    // MCP door: at least one gbrain MCP tool must have fired (as in T4).
+    expect(parsed.toolCalls.some((t) => t.startsWith('gbrain_'))).toBe(true);
   }, 600_000);
 });

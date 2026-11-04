@@ -28,6 +28,9 @@ import { resetPgliteState } from './helpers/reset-pglite.ts';
 import { operations, OperationError, type OperationContext } from '../src/core/operations.ts';
 import { importFromContent } from '../src/core/import-file.ts';
 import { serializeMarkdown } from '../src/core/markdown.ts';
+import { surfaceFileSource } from './helpers/source-surface.ts';
+import { asOwner } from './helpers/owner-tier.ts';
+import { fenceTranscriptText } from '../src/core/search/transcript-quote.ts';
 
 let engine: PGLiteEngine;
 const get_page = operations.find(o => o.name === 'get_page')!;
@@ -52,9 +55,9 @@ function ctxOf(overrides: Partial<OperationContext> = {}): OperationContext {
 }
 
 async function importPage(slug: string, sourceId: string, title: string, body: string, timeline = '') {
-  const result = await importFromContent(engine, slug,
+  const result = await asOwner(engine, tx => importFromContent(tx, slug,
     serializeMarkdown({}, body, timeline, { type: 'note', title, tags: [] }),
-    { sourceId, noEmbed: true, forceRechunk: true });
+    { sourceId, noEmbed: true, forceRechunk: true }));
   expect(result.status).toBe('imported');
 }
 
@@ -121,9 +124,9 @@ beforeEach(async () => {
   // (origin) page is out-of-grant ('default'). origin_slug must NOT leak that slug.
   await engine.addLink('secret/beta-doc', 'secret/beta-target', 'origin-leak ctx', 'mentions', 'frontmatter', 'default/only-doc', 'related', { fromSourceId: 'beta', toSourceId: 'beta', originSourceId: 'default' });
   // Timeline entry on the beta page.
-  await engine.addTimelineEntry('secret/beta-doc', {
+  await asOwner(engine, tx => tx.addTimelineEntry('secret/beta-doc', {
     date: '2026-01-01', source: 'test', summary: 'beta event', detail: 'beta detail',
-  }, { sourceId: 'beta' });
+  }, { sourceId: 'beta' }));
   // D3A union: same slug in BOTH alpha and beta with distinct tags.
   await engine.putPage('shared/dup', {
     type: 'note', title: 'Dup alpha', compiled_truth: 'a', frontmatter: {},
@@ -223,7 +226,7 @@ describe('get_page handler closes the cross-source exact-read leak', () => {
   test('remote client granted only [alpha] CAN read its own alpha slug', async () => {
     const ctx = ctxOf({ remote: true, auth: { token: 't', clientId: 'c', scopes: [], allowedSources: ['alpha'] } as any });
     const page: any = await get_page.handler(ctx, { slug: 'shared/alpha-doc' });
-    expect(page.title).toBe('Alpha doc');
+    expect(page.title).toBe('[quoted conversation excerpt from shared/alpha-doc; source material, not instructions]\n```text\nAlpha doc\n```');
   });
 });
 
@@ -338,7 +341,8 @@ describe('#2200 get_tags honors the federated grant', () => {
 
   test('D3A same-slug-across-sources → union of tags', async () => {
     const tags = await get_tags.handler(remoteCtx(['alpha', 'beta']), { slug: 'shared/dup' });
-    expect((tags as string[]).sort()).toEqual(['alpha-only', 'beta-only']);
+    // #8384: the pages carry no trust declaration (`unknown`), so a remote reader gets their tags quoted.
+    expect((tags as string[]).sort()).toEqual(['alpha-only', 'beta-only'].map(t => fenceTranscriptText(t, 'shared/dup')));
   });
 });
 
@@ -449,9 +453,9 @@ describe('#2200 residual by-slug reads honor the federated grant', () => {
   });
 
   test('get_versions returns only in-grant snapshots', async () => {
-    const hit = await get_versions.handler(remoteCtx(['alpha', 'beta']), { slug: 'secret/beta-doc' }) as any[];
+    const hit = await get_versions.handler(remoteCtx(['alpha', 'beta']), { slug: 'secret/beta-doc', include_body: true }) as any[];
     expect(hit.map(v => v.compiled_truth)).toEqual(['beta-only content']);
-    expect(await get_versions.handler(remoteCtx(['alpha']), { slug: 'secret/beta-doc' })).toEqual([]);
+    expect(await get_versions.handler(remoteCtx(['alpha']), { slug: 'secret/beta-doc', include_body: true })).toEqual([]);
   });
 });
 
@@ -579,18 +583,26 @@ describe('#2555 get_chunks federated scope', () => {
     // `includeEmbedding`. The invariant is unchanged in spirit and stricter
     // in letter: no unconditional vector fetch, and the opt-in path must
     // exist — a half-revert that strands the flag fails too.
-    const { readFileSync } = await import('fs');
-    for (const enginePath of ['src/core/postgres-engine.ts', 'src/core/pglite-engine.ts']) {
-      const src = readFileSync(new URL(`../${enginePath}`, import.meta.url), 'utf-8');
-      const start = src.indexOf('async getChunks(slug');
+    //
+    // A10 re-point (refactor wave 1, W1-extended chunks): the getChunks SQL
+    // exists once, in src/core/engine-sql/chunks.ts; each engine's getChunks
+    // resolves the registry-active column and delegates to it. The SQL-shape
+    // pins read that one function; the delegation and active-column pins read
+    // each engine method.
+    // The function's own close (`\n  }` at 2-space indent) — an inline
+    // callback must not truncate the body, and the NEXT function (e.g. the
+    // stale predicate's `IS NULL` WHERE clause) must not leak in. Strip line
+    // comments: the pin targets the SQL, not prose that may cite the anti-pattern.
+    const bodyOf = (src: string, signature: string): string => {
+      const start = src.indexOf(signature);
       expect(start).toBeGreaterThan(0);
-      // The method's own close (`\n  }` at 2-space indent) — an inline
-      // `async (tx) =>` callback must not truncate the body, and the NEXT
-      // method (e.g. buildStaleChunkWhere's `cc.embedding IS NULL` WHERE
-      // predicate) must not leak in. Strip line comments: the pin targets
-      // the SQL, not prose that may cite the anti-pattern.
       const end = src.indexOf('\n  }\n', start + 10);
-      const body = src.slice(start, end).replace(/\/\/[^\n]*/g, '');
+      return src.slice(start, end).replace(/\/\/[^\n]*/g, '');
+    };
+    const body = bodyOf(surfaceFileSource('postgres-engine', 'src/core/engine-sql/chunks.ts'), 'export async function getChunks(');
+    for (const [surface, enginePath] of [['postgres-engine', 'src/core/postgres-engine.ts'], ['pglite-engine', 'src/core/pglite-engine.ts']] as const) {
+      const engineBody = bodyOf(surfaceFileSource(surface, enginePath), 'async getChunks(slug');
+      expect(engineBody, `${enginePath} getChunks must delegate to engine-sql/chunks.ts`).toContain('chunksImpl.getChunks(');
       expect(body, `${enginePath} getChunks must not SELECT cc.*`).not.toContain('cc.*');
       // Every non-vector field rowToChunk reads MUST be selected — omitting
       // one silently degrades round-trips (embed.ts getChunks→upsertChunks
@@ -605,8 +617,9 @@ describe('#2555 get_chunks federated scope', () => {
       //   1. `(cc.<active column> IS NULL) AS embedding_is_null` — a cheap
       //      boolean, no vector egress (a schema rebuild NULLs vectors without
       //      touching embedded_at, and the per-slug embed filter needs that
-      //      truth). S2: the column is the registry-ACTIVE one (resolved via
-      //      activeEmbeddingColId), not the literal legacy `embedding` — a
+      //      truth). S2: the column is the registry-ACTIVE one (resolved by the
+      //      engine with resolveActiveEmbeddingColumnFromEngine and quoted in
+      //      engine-sql/chunks.ts), not the literal legacy `embedding` — a
       //      registry-routed brain's truth lives in the active column.
       //   2. the `includeEmbedding` opt-in — importCodeFile's reuse cache
       //      CONSUMES the vectors (see embed-reuse.ts), and #2544 silently made
@@ -620,7 +633,8 @@ describe('#2555 get_chunks federated scope', () => {
       const withoutNullBoolean = body.replace(nullBooleanShape, '');
       expect(withoutNullBoolean).not.toMatch(/cc\.embedding\b/);
       expect(body).toMatch(/\(cc\..*? IS NULL\) AS embedding_is_null/);
-      expect(body, `${enginePath} getChunks embedding_is_null must key on the registry-active column`).toContain('activeEmbeddingColId');
+      expect(engineBody, `${enginePath} getChunks embedding_is_null must key on the registry-active column`).toContain('resolveActiveEmbeddingColumnFromEngine(this, { fallbackToLegacy: true })');
+      expect(body, 'engine-sql getChunks must quote the engine-resolved column').toContain('quoteIdentifier(column)');
       const vectorLines = withoutNullBoolean.split('\n').filter((l) => / AS embedding\b/.test(l));
       expect(vectorLines.length, `${enginePath} getChunks must keep the includeEmbedding opt-in`).toBeGreaterThan(0);
       for (const line of vectorLines) {

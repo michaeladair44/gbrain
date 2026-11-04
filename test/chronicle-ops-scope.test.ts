@@ -22,6 +22,7 @@ import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:tes
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 import { operations, type OperationContext } from '../src/core/operations.ts';
+import { fenceTranscriptText } from '../src/core/search/transcript-quote.ts';
 
 let engine: PGLiteEngine;
 
@@ -195,14 +196,15 @@ beforeEach(async () => {
   );
   if (updated.length !== 1) throw new Error(`CROSS fixture: expected 1 repointed row, got ${updated.length}`);
 
-  // ── ontology (volunteer_chronicle arm): one diary-sourced, one public. ──
+  // ── ontology (volunteer_chronicle arm): one diary-sourced, one public, both
+  // world-visible so only the diary rule can redact. ──
   await engine.mergeOntologyFact({
     entitySlug: 'people/alpha-person', dimension: 'affect', value: 'DIARYONLYVALUE',
-    source: 'life/diary/2026-06-18', sourceId: 'srcalpha',
+    source: 'life/diary/2026-06-18', sourceId: 'srcalpha', visibility: 'world',
   });
   await engine.mergeOntologyFact({
     entitySlug: 'people/alpha-person', dimension: 'role', value: 'publicrole',
-    source: 'meetings/alpha-sync', sourceId: 'srcalpha',
+    source: 'meetings/alpha-sync', sourceId: 'srcalpha', visibility: 'world',
   });
 }, 60_000);
 
@@ -288,7 +290,7 @@ describe('far-endpoint: alpha row whose event_page_id points at a beta page', ()
     for (const [label, mk] of [['scalar', remoteScalar], ['federated', remoteFederated]] as const) {
       const rows = await chronicle_day.handler(mk(), { date: CROSS_DATE }) as any[];
       expect(`${label}:${rows.length}`).toBe(`${label}:1`);
-      expect(rows[0].summary).toBe('alpha cross row summary'); // alpha's own data survives
+      expect(rows[0].summary).toBe(fenceTranscriptText('alpha cross row summary', 'meetings/alpha-sync')); // alpha's own data survives, quoted (#8377)
       expect(rows[0].page_slug).toBe('meetings/alpha-sync');
       expect(`${label}:${rows[0].event_slug}`).toBe(`${label}:null`);
       expect(`${label}:${rows[0].effective_date}`).toBe(`${label}:null`);

@@ -26,29 +26,47 @@
  */
 
 import { createHash } from 'crypto';
-import { hasScope } from '../core/scope.ts';
+import { hasScope, operationScopesAllowed } from '../core/scope.ts';
+import { createSkillResources } from './skill-resources.ts';
+import { CAPABILITIES_URI } from './capabilities.ts';
+import { resolveAuthCapabilities } from '../core/harness/capabilities.ts';
 import type { BrainEngine } from '../core/engine.ts';
 import { buildToolDefs } from './tool-defs.ts';
-import { resolveMcpInstructions } from './instructions.ts';
+import { MCP_SERVER_DESCRIPTION, readInstructionContent, resolveMcpInstructions } from './instructions.ts';
+import { httpInstructionTools } from './initialize-context.ts';
 import { resolveWritebackConfig, ambientOptsFrom } from '../core/facts/writeback-config.ts';
-import { operations, operationsByName } from '../core/operations.ts';
+import { operations, operationsByName, opAllowedForBoundClient } from '../core/operations.ts';
+import { scopeDeniedError } from '../core/ops/op-fix.ts';
+import { ON_BEHALF_OF_HEADER } from '../core/access/audience.ts';
+import { ACTOR_HEADER, QM_AUDIENCE_HEADER, withAttestRight } from '../core/access/actor-model.ts';
+import { qmMemoryToolResult } from '../core/ops/qm-memory.ts';
+import { isCallable, publishGatesFromDisabled } from '../core/ops/callable.ts';
 import type { AuthInfo } from '../core/operations.ts';
 import { VERSION } from '../version.ts';
-import { dispatchToolCall, requestLogStatusForResult } from './dispatch.ts';
+import { audienceRefusal, dispatchToolCall, requestLogStatusForResult, errorResult } from './dispatch.ts';
+import { GBRAIN_CLIENT_HEADER, isGbrainThinClient, resolveResultRowsMode, resultRowsForRequest } from './result-rows.ts';
 import { parseStrictParamsMode } from './validate-params.ts';
-import { filterOpsForSurface, clampSurface, type McpSurface } from './surface.ts';
+import { filterOpsForSurface, clampSurface, advertisedOps, resolveAdvertisedSurface, type McpSurface } from './surface.ts';
 import { disabledOpsForPublishGates } from './publish-gates.ts';
-import { loadConfig } from '../core/config.ts';
+import { loadServeConfigs } from './serve-config.ts';
 import { buildDefaultLimiters, type RateLimiter } from './rate-limit.ts';
 import { sqlQueryForEngine } from '../core/sql-query.ts';
 import { degradedLastError, isEngineDegraded } from '../core/degraded-marker.ts';
 import { classifyPgAccessError } from '../core/pg-access-classify.ts';
 import { redactConnectionInfo } from '../core/audit/redact-connection-info.ts';
 import { redactUrlsInText } from '../core/url-redact.ts';
-import { normalizeTokenScopes, parseLegacyTokenScope, parseTakesHoldersAllowList, coerceLegacyPermissions } from '../core/legacy-token-scope.ts';
-export { parseLegacyTokenScope };
+import { authSourcesFromGrant, privatePagesAuth } from '../core/grants/model.ts';
+import { resolveTokenGrant, touchTokenLastUsed } from '../core/grants/legacy-token.ts';
+import { storedMinTrust } from '../core/trust/tier.ts';
+import { tokenMemberBinding } from '../core/access/token-binding.ts';
+export { parseLegacyTokenScope } from '../core/legacy-token-scope.ts';
 
 const DEFAULT_BODY_CAP = 1024 * 1024; // 1 MiB
+
+/** #6007: what an agent does after a 413: nothing was processed; a batch goes smaller, a big page goes by file. */
+function oversizeSuggestion(bodyCap: number): string {
+  return `Nothing was processed: this transport reads at most ${bodyCap} bytes per request (GBRAIN_HTTP_MAX_BODY_BYTES on the brain host). Send put_pages as smaller batches, a new request_id per call. Do not split a page: one page over this limit goes by file instead, so ask the user to write it into the brain repository and run gbrain sync, or to run gbrain import <file> or gbrain put <slug> < file on the brain host.`;
+}
 
 function hashToken(token: string): string {
   return createHash('sha256').update(token).digest('hex');
@@ -86,6 +104,8 @@ interface HttpTransportOptions {
 
 interface AuthResult {
   ok: boolean;
+  /** GBRA-218: why a known token was refused (a member binding that cannot read). */
+  code?: 'access_member_disabled';
   tokenId?: string;
   tokenName?: string;
   /** v0.28: per-token allow-list for takes.holder. Default ['world'] when permissions row absent. */
@@ -165,6 +185,25 @@ function resolveClientIp(req: Request, server: { requestIP: (r: Request) => { ad
   return sock?.address || 'unknown';
 }
 
+/** The 401 body for a refused bearer token; GBRA-218 names a member binding that cannot read. */
+function authFailureBody(code: AuthResult['code']): Record<string, string> {
+  return code === 'access_member_disabled'
+    ? { error: 'invalid_token', code, message: 'This token is bound to a member who is disabled, removed or missing. Ask the brain operator to enable the member or rebind the token (gbrain auth rescope --token <name> --member <id>|none).' }
+    : { error: 'invalid_token', message: 'Bearer token required. Create one: gbrain auth create <name>' };
+}
+
+/**
+ * GST-359 D: a request carrying x-qm-audience (QM's channel audience, not served yet) is refused before any work on
+ * every method that reads or runs a tool: tools/call gets the refusal result, the others a JSON-RPC error. Null otherwise.
+ */
+function qmAudienceRefusal(req: Request, body: { method?: string; params?: any; id?: any }, auth: AuthInfo): { log: string; body: Record<string, unknown> } | null {
+  const { method, params, id } = body;
+  if (req.headers.get(QM_AUDIENCE_HEADER) === null || !['tools/list', 'tools/call', 'resources/list', 'resources/read'].includes(method ?? '')) return null;
+  const op = method === 'tools/call' ? String(params?.name ?? 'unknown') : method!;
+  const refused = audienceRefusal(op, { auth, transport: 'http' });
+  return method === 'tools/call' ? { log: `tools/call:${op}`, body: { jsonrpc: '2.0', id, result: refused.result } } : { log: op, body: { jsonrpc: '2.0', id, error: refused.rpc } };
+}
+
 export async function startHttpTransport(opts: HttpTransportOptions) {
   const { port, engine } = opts;
 
@@ -204,10 +243,10 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
   // config plane — this transport builds its tool list once, so a
   // `mcp.strict_params` flip needs a restart here (deliberate; the OAuth
   // serve-http path re-reads dual-plane per request). Dispatch-side
-  // enforcement still resolves per call.
-  const fileConfig = loadConfig();
+  // enforcement still resolves per call. mcp.advertised_surface (file plane) narrows the tool list only.
+  const { fileConfig, operationConfig } = await loadServeConfigs(engine); // #6589: operations see file + env over the DB plane
   const strictParams = parseStrictParamsMode(fileConfig?.mcp?.strict_params) === 'reject';
-  const tools = buildToolDefs(surfacedOps, { strictParams });
+  const tools = buildToolDefs(advertisedOps(surfacedOps, surface, await resolveAdvertisedSurface(null, fileConfig)), { strictParams });
 
   /**
    * v0.41.3 (T6): single consolidated CORS header builder. Pre-fix there were
@@ -249,39 +288,36 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
     const token = authHeader.slice(7);
     const hash = hashToken(token);
     try {
+      // SELECT * reads every schema generation (pre-F3 rows lack the grant columns).
       const [row] = await sql`
-        SELECT id, name, permissions, scopes FROM access_tokens
+        SELECT * FROM access_tokens
         WHERE token_hash = ${hash} AND revoked_at IS NULL
       `;
       if (!row) return { ok: false };
       const rowId = row.id as string;
       const rowName = row.name as string;
-      // Debounced last_used_at update — only writes once per token per 60s.
-      // SQL-level WHERE clause keeps this race-tolerant even under concurrent requests.
-      sql`UPDATE access_tokens
-          SET last_used_at = now()
-          WHERE id = ${rowId}
-            AND (last_used_at IS NULL OR last_used_at < now() - interval '60 seconds')`
-        .catch(() => { /* fire-and-forget */ });
-      // v0.28: extract per-token takes-holder allow-list. Fail-safe default
-      // is ['world'] — a token with no permissions row sees public claims only.
-      // #2529: decode + parse via the shared core helpers so this transport and
-      // the OAuth provider behind `serve --http` cannot drift — including a
-      // double-encoded jsonb string scalar (#2339 class), which both now decode
-      // identically instead of one honoring the grant while the other fails
-      // open to ['world'].
-      const perms = coerceLegacyPermissions((row as { permissions?: unknown }).permissions);
-      const allowList = parseTakesHoldersAllowList(perms?.takes_holders) ?? ['world'];
-      // #1336: honor the operator-set source grant stored on the token.
-      const { sourceId, allowedSources } = parseLegacyTokenScope(perms?.source_id);
+      // Debounced fire-and-forget last_used_at update, shared with the OAuth provider.
+      void touchTokenLastUsed(sql, row);
+      // One grant shape (grants/model.ts) shared with the OAuth provider
+      // behind `serve --http`, so the two transports cannot drift; a row still
+      // on the legacy shape is converted on this read. Takes holders fail safe
+      // to ['world']; #1336 honors the stored source grant.
+      const grant = await resolveTokenGrant(sql, row);
+      const binding = await tokenMemberBinding(sql, row.member_id, row.may_act_for).catch(() => null); // GBRA-218 verify join
+      if (!binding) return { ok: false, code: 'access_member_disabled' };
+      const allowList = grant.takesHolders ?? ['world'];
+      const { sourceId, allowedSources, hasSourceGrant } = authSourcesFromGrant(grant);
       const auth: AuthInfo = {
         token,
         clientId: rowId,
         principal: { kind: 'legacy_token', id: rowId },
+        ...withAttestRight(binding, row, 'legacy'),
         clientName: rowName,
-        scopes: normalizeTokenScopes(row.scopes) ?? ['read', 'write', 'admin'],
+        scopes: grant.scopes,
         sourceId,
-        ...(allowedSources ? { allowedSources } : {}),
+        ...(grant.allowedOperations === null ? {} : { allowedOperations: grant.allowedOperations }),
+        ...(allowedSources ? { allowedSources } : {}), ...privatePagesAuth(grant),
+        ...(storedMinTrust(row.min_trust) ? { minTrust: storedMinTrust(row.min_trust) } : {}),
       };
       return {
         ok: true,
@@ -294,7 +330,7 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
         auth,
         // #3242: distinguish "operator granted a scope" from "historical
         // no-grant floor" — only the latter widens to federated sources.
-        hasSourceGrant: perms?.source_id != null,
+        hasSourceGrant,
       };
     } catch {
       return { ok: false };
@@ -376,7 +412,7 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
       if (bodyText === null) {
         logRequest(null, 'unknown', 'body_too_large', Date.now() - startedMs);
         return Response.json(
-          { error: 'payload_too_large', message: `Request body exceeds ${bodyCap} bytes` },
+          { error: 'payload_too_large', message: `Request body exceeds ${bodyCap} bytes`, suggestion: oversizeSuggestion(bodyCap) },
           { status: 413, headers: corsHeaders(origin) },
         );
       }
@@ -385,10 +421,7 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
       const auth = await validateToken(req.headers.get('Authorization'));
       if (!auth.ok) {
         logRequest(null, 'unknown', 'auth_failed', Date.now() - startedMs);
-        return Response.json(
-          { error: 'invalid_token', message: 'Bearer token required. Create one: gbrain auth create <name>' },
-          { status: 401, headers: corsHeaders(origin) },
-        );
+        return Response.json(authFailureBody(auth.code), { status: 401, headers: corsHeaders(origin) });
       }
 
       // Post-auth token-id rate limit. Limits runaway authed clients.
@@ -417,7 +450,7 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
       }
 
       const { method, params, id } = body;
-
+      const audienceRefused = qmAudienceRefusal(req, body, auth.auth!); if (audienceRefused) { logRequest(auth.tokenName!, audienceRefused.log, 'error', Date.now() - startedMs); return Response.json(audienceRefused.body, { headers: corsHeaders(origin) }); }
       // initialize
       if (method === 'initialize') {
         logRequest(auth.tokenName!, 'initialize', 'success', Date.now() - startedMs);
@@ -429,18 +462,18 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
         // actually call it (OV2-14; a verbs/starter-pinned serve must not
         // order agents to call a tool dispatch will deny).
         const writeback = await resolveWritebackConfig(engine, fileConfig);
+        const canWriteOp = (name: string) => hasScope(auth.auth!.scopes, 'write') && (!surfaceAllowedOps || surfaceAllowedOps.has(name));
         return Response.json(
           {
             result: {
               protocolVersion: '2025-03-26',
-              serverInfo: { name: 'gbrain', version: VERSION },
-              capabilities: { tools: {} },
+              serverInfo: { name: 'gbrain', version: VERSION, description: MCP_SERVER_DESCRIPTION },
+              capabilities: { tools: {}, resources: {} },
               // #4748: contract (+ opt-in writeback section) + deployment identity.
               instructions: resolveMcpInstructions(fileConfig, process.env, {
-                writeback: ambientOptsFrom(writeback, {
-                  remember: hasScope(auth.auth!.scopes, 'write') && (!surfaceAllowedOps || surfaceAllowedOps.has('remember')),
-                  extractFacts: hasScope(auth.auth!.scopes, 'write') && (!surfaceAllowedOps || surfaceAllowedOps.has('extract_facts')),
-                }),
+                writeback: ambientOptsFrom(writeback, { remember: canWriteOp('remember'), extractFacts: canWriteOp('extract_facts') }),
+                tools: await httpInstructionTools(engine, fileConfig, { ops: surfacedOps, surface, auth: auth.auth!, allowedOps: surfaceAllowedOps }), // F1
+                ...await readInstructionContent(engine),
               }),
             },
             jsonrpc: '2.0',
@@ -453,6 +486,23 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
       // notifications/initialized — acknowledge with 204
       if (method === 'notifications/initialized') {
         return new Response(null, { status: 204, headers: corsHeaders(origin) });
+      }
+
+      if (method === 'resources/list' || method === 'resources/read') {
+        const resources = createSkillResources(engine, async () => ({ remote: true, transport: 'http',
+          auth: auth.auth!, sourceId: auth.sourceId ?? 'default', allowedOps: surfaceAllowedOps, surface, config: operationConfig }));
+        try {
+          const result = method === 'resources/list'
+            ? { resources: [{ uri: CAPABILITIES_URI, name: 'GBrain capabilities', mimeType: 'application/json' }, ...await resources.list()] }
+            : params?.uri === CAPABILITIES_URI
+              ? { contents: [{ uri: CAPABILITIES_URI, mimeType: 'application/json', text: JSON.stringify(await resolveAuthCapabilities(auth.auth!, engine, fileConfig ?? { engine: engine.kind })) }] }
+              : await resources.read(params?.uri);
+          logRequest(auth.tokenName!, method, 'success', Date.now() - startedMs);
+          return Response.json({ jsonrpc: '2.0', id, result }, { headers: corsHeaders(origin) });
+        } catch {
+          logRequest(auth.tokenName!, method, 'error', Date.now() - startedMs);
+          return Response.json({ jsonrpc: '2.0', id, error: { code: -32602, message: 'Unknown or unavailable resource' } }, { headers: corsHeaders(origin) });
+        }
       }
 
       // tools/list
@@ -468,10 +518,11 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
         // unconditionally, so gates-off served the exact listed-but-denied
         // catalog lie E5 (test/truthful-catalog.e2e-lite.test.ts) pins out.
         const gateDisabled = await disabledOpsForPublishGates(engine, fileConfig);
+        const publishGates = publishGatesFromDisabled(surfacedOps, gateDisabled); // A2: one callability predicate + bound-client fence
         const visibleTools = tools.filter(t => {
           const op = operationsByName[t.name];
-          return op && !gateDisabled.has(t.name) && (hasScope(auth.auth!.scopes, op.scope ?? 'read')
-            || (op.agentCallable === true && hasScope(auth.auth!.scopes, 'agent')));
+          return op && isCallable(op, { transport: 'http', surface, scopes: auth.auth!.scopes, publishGates, allowedOps: surfaceAllowedOps })
+            && opAllowedForBoundClient(auth.auth!, op);
         });
         logRequest(auth.tokenName!, 'tools/list', 'success', Date.now() - startedMs);
         return Response.json(
@@ -485,11 +536,13 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
         const toolName: string = params?.name ?? 'unknown';
         const args: Record<string, unknown> = params?.arguments ?? {};
         const op = operationsByName[toolName];
-        if (op && !op.localOnly && !hasScope(auth.auth!.scopes, op.scope ?? 'read') &&
-            !(op.agentCallable === true && hasScope(auth.auth!.scopes, 'agent'))) {
+        // #5575: cliOnly ops reach the dispatcher's trusted_local_only refusal (the host command), never a grant-widening scope fix.
+        if (op && !op.localOnly && !op.cliOnly && !operationScopesAllowed(auth.auth!.scopes, op)) {
           logRequest(auth.tokenName!, `tools/call:${toolName}`, 'denied_after_list', Date.now() - startedMs);
-          return Response.json({ jsonrpc: '2.0', id, result: { isError: true, content: [{ type: 'text',
-            text: JSON.stringify({ error: 'permission_denied', message: `Tool requires ${op.scope ?? 'read'} scope` }) }] } },
+          // Frozen v1 pair: `error: permission_denied` stays; `code: insufficient_scope`.
+          const denial = scopeDeniedError({ op: toolName, required: [op.scope ?? 'read', ...(op.requiredScopes ?? [])], auth: auth.auth,
+            transport: 'http', message: `Tool requires ${op.scope ?? 'read'} scope`, legacy_error: 'permission_denied' });
+          return Response.json({ jsonrpc: '2.0', id, result: qmMemoryToolResult(toolName, errorResult(denial, { remote: true, transport: 'http', auth: auth.auth }, { op: toolName })) },
             { headers: corsHeaders(origin) });
         }
         // v0.28: thread per-token takes-holder allow-list so takes_list /
@@ -508,13 +561,14 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
         }
         const result = await dispatchToolCall(engine, toolName, args, {
           remote: true,
+          admissionOrigin: 'interactive', config: operationConfig,
           // WP1/D7: network transport — the dispatch-layer localOnly
           // backstop keys off this marker.
-          transport: 'http',
+          transport: 'http', inboundFrameBytes: bodyCap,
           takesHoldersAllowList: auth.takesHoldersAllowList,
           sourceId: auth.sourceId,
-          ...(localFederated ? { localFederatedSourceIds: localFederated } : {}),
-          // #1336: thread the token's federated_read grant so read ops scope
+          ...(localFederated ? { localFederatedSourceIds: localFederated } : {}), onBehalfOf: { header: req.headers.get(ON_BEHALF_OF_HEADER) ?? undefined, requestMeta: params?._meta },
+          actor: { header: req.headers.get(ACTOR_HEADER) ?? undefined, audience: req.headers.get(QM_AUDIENCE_HEADER) ?? undefined }, // #1336: thread the token's federated_read grant so read ops scope
           // to the operator-granted sources via sourceScopeOpts.
           auth: auth.auth,
           // MEMORY_VERBS v1 [c1/c2]: fail-closed surface enforcement here too.
@@ -523,6 +577,8 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
           // WP4 (D2): this transport has no per-client rows, so its surface
           // IS the ceiling request_tools bounds catalog + persist by.
           surfaceCeiling: surface,
+          resultRows: resultRowsForRequest(req.headers.get(GBRAIN_CLIENT_HEADER), await resolveResultRowsMode(engine, fileConfig)), // C1; row shape only, never authority
+          ...(isGbrainThinClient(req.headers.get(GBRAIN_CLIENT_HEADER)) ? { thinClient: true } : {}), // large pages: default body mode only, never authority
         });
         // Same status taxonomy as the OAuth transport (denied_after_list /
         // success_with_warnings feed the amendment-33 metric + E4 usage).

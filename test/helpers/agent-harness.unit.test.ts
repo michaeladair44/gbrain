@@ -8,27 +8,22 @@
  *   - hermeticChildEnv: drops CONDUCTOR_* / CLAUDE_* / GSTACK_* / MCP_* /
  *     GBRAIN_*, promotes GSTACK_ANTHROPIC_API_KEY, honors extraAllow, and lets
  *     overrides win.
- *   - resolveClaudeBinary / resolveCodexBinary SMOKE (whatever this machine
- *     has — assertion is only that the result is a string-or-null, plus a note
- *     printed when found).
  *
  * The env test mutates process.env and restores it in finally so it never
  * leaks into sibling tests.
  */
 import { describe, test, expect } from 'bun:test';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   parseClaudeStream,
   parseCodexJsonl,
+  codexMcpApprovalArgs,
   hermeticChildEnv,
   hermesChildEnv,
   grokChildEnv,
   promotedEnv,
-  resolveClaudeBinary,
-  resolveCodexBinary,
-  resolveHermesBinary,
   resolveGrokBinary,
   hasHermesAuth,
   hasGrokAuth,
@@ -40,8 +35,25 @@ import {
   seedOpencodeConfig,
   parseOpencodeJsonl,
   runOneShotSpawn,
+  opencodeOneShotTurn,
 } from './agent-harness.ts';
 import { withEnv } from './with-env.ts';
+
+describe('fixture MCP approvals', () => {
+  test('the default changes no policy; explicit tools stay in their server/plugin scope', () => {
+    expect(codexMcpApprovalArgs()).toEqual([]);
+    const args = codexMcpApprovalArgs([
+      { server: 'fixture', tools: ['query', 'query'] },
+      { plugin: 'fixture@marketplace', server: 'gbrain', tools: ['recall'] },
+    ]);
+    expect(args).toEqual([
+      '-c', 'mcp_servers.fixture.tools.query.approval_mode="approve"',
+      '-c', 'plugins.fixture@marketplace.mcp_servers.gbrain.tools.recall.approval_mode="approve"',
+    ]);
+    expect(() => codexMcpApprovalArgs([{ server: 'fixture.tools', tools: ['query'] }])).toThrow('single config-path segments');
+    expect(() => codexMcpApprovalArgs([{ server: 'fixture', tools: ['query.approval_mode'] }])).toThrow('single config-path segments');
+  });
+});
 
 // A captured claude stream-json turn: a system init line, an assistant text +
 // tool_use turn, a tool_result user line, a second assistant text turn, and the
@@ -199,30 +211,6 @@ describe('hermeticChildEnv', () => {
         expect(scrubbed.CODEX_HOME).toBeUndefined();
       },
     );
-  });
-});
-
-describe('binary resolution SMOKE', () => {
-  test('resolveClaudeBinary returns a string or null', () => {
-    const bin = resolveClaudeBinary();
-    expect(bin === null || typeof bin === 'string').toBe(true);
-    if (bin) console.log(`[smoke] claude resolved at: ${bin}`);
-  });
-
-  test('resolveCodexBinary returns a string or null', () => {
-    const bin = resolveCodexBinary();
-    expect(bin === null || typeof bin === 'string').toBe(true);
-    if (bin) console.log(`[smoke] codex resolved at: ${bin}`);
-  });
-
-  test('resolveHermesBinary returns a string or null', () => {
-    const bin = resolveHermesBinary();
-    expect(bin === null || typeof bin === 'string').toBe(true);
-    if (bin) console.log(`[smoke] hermes resolved at: ${bin}`);
-  });
-
-  test('hasHermesAuth returns a boolean', () => {
-    expect(typeof hasHermesAuth()).toBe('boolean');
   });
 });
 
@@ -519,7 +507,7 @@ describe('resolveGrokBinary — fail-closed GROK_BIN handling', () => {
 describe('opencodeChildEnv — XDG redirection + explicit anthropic re-admission (5a-core factory)', () => {
   test('ANTHROPIC_API_KEY survives via explicit override; HOME + both XDG dirs point at the temp home; autoupdate env kill set', async () => {
     await withEnv({ ANTHROPIC_API_KEY: 'ant-child-sentinel' }, () => {
-      const env = opencodeChildEnv('/tmp/opencode-child-test');
+      const env = opencodeChildEnv('/tmp/opencode-child-test', { paid: true });
       expect(env.ANTHROPIC_API_KEY).toBe('ant-child-sentinel');
       expect(env.HOME).toBe('/tmp/opencode-child-test');
       expect(env.XDG_CONFIG_HOME).toBe('/tmp/opencode-child-test/.config');
@@ -543,6 +531,7 @@ describe('opencodeChildEnv — XDG redirection + explicit anthropic re-admission
     }, () => {
       const env = opencodeChildEnv('/tmp/opencode-child-test');
       for (const k of [
+        'ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL',
         'OPENAI_API_KEY', 'XAI_API_KEY', 'OPENROUTER_API_KEY', 'GOOGLE_GENERATIVE_AI_API_KEY',
         'OPENCODE_CONFIG', 'OPENCODE_CONFIG_DIR', 'OPENCODE_CONFIG_CONTENT',
         'GITHUB_ENV',
@@ -646,8 +635,27 @@ describe('parseOpencodeJsonl (pure — fixtures pinned to observed v1.18.18 shap
   });
 
   test('empty/garbage input → empty result, never throws', () => {
-    expect(parseOpencodeJsonl([])).toEqual({ finalText: '', toolCalls: [] });
-    expect(parseOpencodeJsonl(['{', 'null', '42'])).toEqual({ finalText: '', toolCalls: [] });
+    expect(parseOpencodeJsonl([])).toEqual({ finalText: '', toolCalls: [], errors: [] });
+    expect(parseOpencodeJsonl(['{', 'null', '42'])).toEqual({ finalText: '', toolCalls: [], errors: [] });
+  });
+
+  test('#6049: a provider error event is collected with its status, name and response error type', () => {
+    const line = JSON.stringify({ type: 'error', error: { name: 'APIError', data: {
+      message: "OpenCode's free tier can only be used from within OpenCode. Download it at https://opencode.ai and keep building.",
+      statusCode: 403, isRetryable: false,
+      responseBody: JSON.stringify({ type: 'error', error: { type: 'FreeTierError', message: '...' } }),
+      metadata: { url: 'https://opencode.ai/zen/v1/chat/completions' },
+    } } });
+    const parsed = parseOpencodeJsonl([line]);
+    expect(parsed.finalText).toBe('');
+    expect(parsed.errors).toEqual(["APIError 403 FreeTierError: OpenCode's free tier can only be used from within OpenCode. Download it at https://opencode.ai and keep building."]);
+  });
+
+  test('#6049: an error event without data or with an unparsable response body still names what it can', () => {
+    expect(parseOpencodeJsonl([JSON.stringify({ type: 'error', error: { name: 'UnknownError' } })]).errors).toEqual(['UnknownError']);
+    expect(parseOpencodeJsonl([JSON.stringify({ type: 'error', error: { name: 'APIError', data: { message: 'upstream 502', statusCode: 502, responseBody: '<html>' } } })]).errors)
+      .toEqual(['APIError 502: upstream 502']);
+    expect(parseOpencodeJsonl([JSON.stringify({ type: 'error' })]).errors).toEqual(['error event without details']);
   });
 });
 
@@ -680,4 +688,120 @@ describe('runOneShotSpawn — drain-cap timer hygiene', () => {
       globalThis.clearTimeout = realClear;
     }
   });
+});
+
+describe('opencodeOneShotTurn — provider refusals logged by opencode surface instead of a silent hang (#6049)', () => {
+  // opencode 1.18.18 answers a free-tier quota refusal ("Free usage limit
+  // reached", HTTP 429) by retrying after the server's retry-after (hours),
+  // printing nothing on stdout; the only trace is the "stream error" line in
+  // <XDG_DATA_HOME>/opencode/log/opencode.log. These stubs replay that exact
+  // log shape so the turn's behavior is pinned without a network call.
+  const QUOTA_LINE =
+    'timestamp=2026-11-01T16:05:31.565Z level=ERROR run=a6ecc561 message="stream error" providerID=opencode modelID=big-pickle ' +
+    'session.id=ses_x small=false agent=build mode=primary error.error="AI_APICallError: Free usage limit reached. ' +
+    'Free models work in OpenCode (https://opencode.ai); subscribe to OpenCode Go to keep going: https://opencode.ai/go"';
+  const TITLE_LINE =
+    'timestamp=2026-11-01T16:05:37.341Z level=ERROR run=a6ecc561 message="stream error" providerID=opencode modelID=big-pickle ' +
+    'session.id=ses_x small=true agent=title mode=primary error.error="AI_RetryError: Failed after 3 attempts. Last error: upstream 502"';
+  const RATE_LIMIT_LINE =
+    'timestamp=2026-11-01T16:05:31.565Z level=ERROR run=c1 message="stream error" providerID=anthropic modelID=claude-haiku-5-5 ' +
+    'session.id=ses_z small=false agent=build mode=primary error.error="AI_APICallError: Rate limit exceeded; retry after 1 second"';
+  const TRANSIENT_LINE =
+    'timestamp=2026-11-01T16:05:31.565Z level=ERROR run=b1 message="stream error" providerID=opencode modelID=big-pickle ' +
+    'session.id=ses_y small=false agent=build mode=primary error.error="AI_APICallError: Bad Gateway"';
+
+  function stubOpencode(dir: string, body: string): string {
+    const bin = join(dir, 'opencode');
+    writeFileSync(bin, `#!/bin/sh\nlog="$XDG_DATA_HOME/opencode/log"\nmkdir -p "$log"\n${body}\n`, { mode: 0o755 });
+    return bin;
+  }
+
+  test('a quota refusal ends the turn within seconds with the provider message (was: timeout with empty stdout)', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gb-oc-quota-'));
+    try {
+      const home = join(dir, 'home');
+      const bin = stubOpencode(dir, `printf '%s\\n%s\\n' '${TITLE_LINE}' '${QUOTA_LINE}' >> "$log/opencode.log"\nexec sleep 600`);
+      const t0 = Date.now();
+      const turn = await withEnv({ OPENCODE_BIN: bin }, () =>
+        opencodeOneShotTurn({ prompt: 'p', cwd: dir, home, timeoutMs: 30_000, format: 'json' }));
+      expect(Date.now() - t0).toBeLessThan(15_000);
+      expect(turn.timedOut).toBe(false);
+      expect(turn.finalText).toBe('');
+      expect(turn.providerRefusal).toBe(
+        'AI_APICallError: Free usage limit reached. Free models work in OpenCode (https://opencode.ai); subscribe to OpenCode Go to keep going: https://opencode.ai/go',
+      );
+      expect(turn.streamErrors).toEqual([turn.providerRefusal!]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test('a transient main-stream error is reported but never cuts short a turn opencode recovers from', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gb-oc-transient-'));
+    try {
+      const home = join(dir, 'home');
+      const text = JSON.stringify({ type: 'text', part: { text: 'recovered' } });
+      const bin = stubOpencode(dir, `printf '%s\\n' '${TRANSIENT_LINE}' >> "$log/opencode.log"\nsleep 3\nprintf '%s\\n' '${text}'`);
+      const turn = await withEnv({ OPENCODE_BIN: bin }, () =>
+        opencodeOneShotTurn({ prompt: 'p', cwd: dir, home, timeoutMs: 30_000, format: 'json' }));
+      expect(turn.exitCode).toBe(0);
+      expect(turn.providerRefusal).toBeUndefined();
+      expect(parseOpencodeJsonl(turn.finalText.split('\n')).finalText).toBe('recovered');
+      expect(turn.streamErrors).toEqual(['AI_APICallError: Bad Gateway']);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test('a provider rate limit is a transient error: the turn runs on and returns what opencode answers after its retry', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gb-oc-ratelimit-'));
+    try {
+      const home = join(dir, 'home');
+      const text = JSON.stringify({ type: 'text', part: { text: 'after-retry' } });
+      const bin = stubOpencode(dir, `printf '%s\\n' '${RATE_LIMIT_LINE}' >> "$log/opencode.log"\nsleep 3\nprintf '%s\\n' '${text}'`);
+      const turn = await withEnv({ OPENCODE_BIN: bin }, () =>
+        opencodeOneShotTurn({ prompt: 'p', cwd: dir, home, timeoutMs: 30_000, format: 'json' }));
+      expect(turn.exitCode).toBe(0);
+      expect(turn.providerRefusal).toBeUndefined();
+      expect(parseOpencodeJsonl(turn.finalText.split('\n')).finalText).toBe('after-retry');
+      expect(turn.streamErrors).toEqual(['AI_APICallError: Rate limit exceeded; retry after 1 second']);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test('a quota refusal still ends the turn within seconds when a descendant keeps the output pipes open', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gb-oc-quota-desc-'));
+    try {
+      const home = join(dir, 'home');
+      const bin = stubOpencode(dir, `printf '%s\\n' '${QUOTA_LINE}' >> "$log/opencode.log"\nsleep 25 &\nexec sleep 600`);
+      const t0 = Date.now();
+      const turn = await withEnv({ OPENCODE_BIN: bin }, () =>
+        opencodeOneShotTurn({ prompt: 'p', cwd: dir, home, timeoutMs: 30_000, format: 'json' }));
+      expect(Date.now() - t0).toBeLessThan(15_000);
+      expect(turn.timedOut).toBe(false);
+      expect(turn.providerRefusal).toContain('Free usage limit reached');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 90_000);
+
+  test('stream errors already in the log from an earlier turn in the same home are not attributed to this turn', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gb-oc-offset-'));
+    try {
+      const home = join(dir, 'home');
+      const logDir = join(home, '.local', 'share', 'opencode', 'log');
+      mkdirSync(logDir, { recursive: true });
+      writeFileSync(join(logDir, 'opencode.log'), `${QUOTA_LINE}\n`);
+      const text = JSON.stringify({ type: 'text', part: { text: 'ok' } });
+      const bin = stubOpencode(dir, `printf '%s\\n' '${text}'`);
+      const turn = await withEnv({ OPENCODE_BIN: bin }, () =>
+        opencodeOneShotTurn({ prompt: 'p', cwd: dir, home, timeoutMs: 30_000, format: 'json' }));
+      expect(turn.exitCode).toBe(0);
+      expect(turn.providerRefusal).toBeUndefined();
+      expect(turn.streamErrors).toEqual([]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 60_000);
 });

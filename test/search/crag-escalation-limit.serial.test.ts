@@ -23,6 +23,7 @@ const actualHybrid = await import(HYBRID_PATH);
 function row(i: number, rerankScore: number): SearchResult {
   return {
     slug: `notes/n${i}`,
+    source_id: 'default',
     page_id: 900000 + i,
     title: `n${i}`,
     type: 'note',
@@ -169,8 +170,12 @@ describe('#4610 escalation limit — resolveEffectiveLimit contract (shared with
     // is a trusted-local privilege. So the effective limit is the CONFIGURED
     // conservative searchLimit (10), not tokenmax's 50; a broken gate would
     // hand back the full 30-row sweep.
+    // The remote page cap (search.remote_page_cap, GBRA-156) would cut these
+    // meaning-only mock rows to 3 pages and hide the limit under test, so it
+    // is off here; test/search-remote-page-cap.test.ts covers the cap.
     calls.length = 0;
     await engine.setConfig('search.mode', 'conservative');
+    await engine.setConfig('search.remote_page_cap', '0');
     try {
       const meta: Record<string, unknown> = {};
       const ctx = {
@@ -194,6 +199,7 @@ describe('#4610 escalation limit — resolveEffectiveLimit contract (shared with
       expect(results.length).toBe(10);
     } finally {
       await engine.setConfig('search.mode', 'balanced');
+      await engine.unsetConfig('search.remote_page_cap');
     }
   }, 30000);
 

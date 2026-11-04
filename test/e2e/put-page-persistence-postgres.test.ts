@@ -11,8 +11,10 @@ import type { PostgresEngine } from '../../src/core/postgres-engine.ts';
 import { configureGateway, resetGateway, __setEmbedTransportForTests } from '../../src/core/ai/gateway.ts';
 import { dispatchToolCall } from '../../src/mcp/dispatch.ts';
 import { acquireWorktree, claimWorktree, getWorktreeBinding } from '../../src/core/persistence/ownership.ts';
-import { registerLocalWriter, withVerifiedLocalRegistration, type LocalRegistration } from '../../src/core/persistence/identity.ts';
+import { localHostId, registerLocalWriter, withVerifiedLocalRegistration, type LocalRegistration } from '../../src/core/persistence/identity.ts';
 import { disposePersistenceConsumer } from '../../src/core/persistence/service.ts';
+import { runPersistenceEffects } from '../../src/core/persistence/effects.ts';
+import { installFaultHook } from '../../src/core/persistence/fault-points.ts';
 import { _resetWriteThroughCacheForTest } from '../../src/core/write-through.ts';
 
 const d = hasDatabase() ? describe : describe.skip;
@@ -89,11 +91,12 @@ d('Postgres put_page persistence', () => {
   test('native lock contention preserves the prior revision and returns a durable same-ID receipt', async () => {
     const first = await put('Original canonical revision.');
     expect(first.payload.state).toBe('committed');
+    await disposePersistenceConsumer(engine);
     const before = await snapshot();
     const disk = readFileSync(join(root, `${slug}.md`), 'utf8');
     const binding = await getWorktreeBinding(engine, 'default');
     expect(binding).not.toBeNull();
-    const holder = await acquireWorktree(binding!);
+    const holder = await acquireWorktree(binding!, 5000);
     expect(holder).not.toBeNull();
     let accepted: Awaited<ReturnType<typeof put>>;
     try {
@@ -136,10 +139,11 @@ d('Postgres put_page persistence', () => {
   test('pgvector failure is reported after the canonical write without rolling back its receipt', async () => {
     config.embedding_disabled = false;
     configureGateway({ embedding_model: 'openai:text-embedding-3-small', embedding_dimensions: 1536, env: { OPENAI_API_KEY: 'sk-test' } });
+    await engine.executeRaw('ALTER TABLE content_chunks ALTER COLUMN embedding TYPE vector(2)');
     __setEmbedTransportForTests(async ({ values }) => {
       expect((await engine.readPageSnapshot(slug, { sourceId: 'default' }))?.page.compiled_truth).toBe('Persists before vector validation.');
       expect(readFileSync(join(root, `${slug}.md`), 'utf8')).toContain('Persists before vector validation.');
-      return { values, warnings: [], embeddings: values.map(() => [0.1, 0.2]), usage: { tokens: 1 } };
+      return { values, warnings: [], embeddings: values.map(() => Array(1536).fill(0.1)), usage: { tokens: 1 } };
     });
     const result = await put('Persists before vector validation.');
     expect(result.response.isError).not.toBe(true);
@@ -151,6 +155,30 @@ d('Postgres put_page persistence', () => {
     expect(observed.payload.effects).toContainEqual({ kind: 'embedding', state: 'queued', reason: 'effect_unavailable' });
     expect((await engine.getChunks(slug, { sourceId: 'default' })).every(chunk => chunk.embedding_is_null)).toBe(true);
     expect((await dispatch('put_page', result.params)).payload.revision).toBe(result.payload.revision);
+  });
+
+  test('provider dimension mismatch fails its effect once without changing the committed canonical receipt', async () => {
+    config.embedding_disabled = false;
+    configureGateway({ embedding_model: 'openai:text-embedding-3-small', embedding_dimensions: 1536, env: { OPENAI_API_KEY: 'sk-test' } });
+    let calls = 0;
+    __setEmbedTransportForTests(async ({ values }) => {
+      calls++;
+      return { values, warnings: [], embeddings: values.map(() => [0.1, 0.2]), usage: { tokens: 1 } };
+    });
+    const result = await put('Canonical content survives an invalid provider dimension.');
+    expect(result.response.isError).not.toBe(true);
+    expect(result.payload.write_through.written).toBe(true);
+    const observed = await embedding(result, 'embedding_configuration');
+    expect(observed.payload.state).toBe('committed');
+    expect(observed.payload.revision).toBe(result.payload.revision);
+    expect(observed.payload.effects).toContainEqual({ kind: 'embedding', state: 'failed', reason: 'embedding_configuration' });
+    expect((await engine.getChunks(slug, { sourceId: 'default' })).every(chunk => chunk.embedding_is_null)).toBe(true);
+    await disposePersistenceConsumer(engine);
+    await runPersistenceEffects(engine, config, { hostId: localHostId(), limit: 20 });
+    expect(calls).toBe(1);
+    expect(readFileSync(join(root, `${slug}.md`), 'utf8')).toContain('Canonical content survives an invalid provider dimension.');
+    expect((await dispatch('put_page', result.params)).payload.revision).toBe(result.payload.revision);
+    expect(calls).toBe(1);
   });
 
   test('slow embedding releases the worktree before other writes and rejects superseded vectors', async () => {
@@ -184,5 +212,28 @@ d('Postgres put_page persistence', () => {
     expect(readFileSync(join(root, `${slug}.md`), 'utf8')).toContain('Replacement saved revision.');
     expect((await engine.getChunks(slug, { sourceId: 'default' })).map(chunk => chunk.chunk_text)).toEqual(['Replacement saved revision.']);
     expect((await dispatch('put_page', original.params)).payload.revision).toBe(original.payload.revision);
+  });
+  test('an embedding effect whose page moves on between its page read and its projection read is superseded on that attempt', async () => {
+    config.embedding_disabled = false;
+    configureGateway({ embedding_model: 'openai:text-embedding-3-small', embedding_dimensions: 1536, env: { OPENAI_API_KEY: 'sk-test' } });
+    __setEmbedTransportForTests(async ({ values }) => ({ values, warnings: [], embeddings: values.map(() => new Array(1536).fill(0.1)), usage: { tokens: 1 } }));
+    // The first embedding effect has read its page at the older revision; the newer one commits (sealed) before it reads the projection.
+    const moved = Promise.withResolvers<Awaited<ReturnType<typeof put>>>();
+    let held = false;
+    installFaultHook(async point => {
+      if (point !== 'effect:embedding:page_read' || held) return;
+      held = true;
+      moved.resolve(await put('Newer saved revision.'));
+    });
+    try {
+      const older = await put('Older saved revision.');
+      expect(older.payload.state).toBe('committed');
+      expect((await moved.promise).payload.state).toBe('committed');
+      const observed = await embedding(older, 'revision_changed');
+      expect(observed.payload.effects).toContainEqual({ kind: 'embedding', state: 'committed', reason: 'revision_changed' });
+      // One attempt: never requeued as projection_pending for a revision no projection will be sealed at.
+      expect(await engine.executeRaw(`SELECT e.attempts, e.error_code FROM persistence_effects e JOIN persistence_requests r ON r.id=e.request_id
+        WHERE r.request_id=$1::uuid AND e.kind='embedding'`, [older.params.request_id])).toEqual([{ attempts: 1, error_code: null }]);
+    } finally { installFaultHook(undefined); }
   });
 });
